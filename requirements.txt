@@ -2,3 +2,8 @@ requests
 duckdb
 python-dotenv
 pandas
+fastapi
+uvicorn
+numpy
+playwright
+beautifulsoup4

@@ -1,17 +1,16 @@
 version: '3.8'
 
 services:
-  strava-ingest:
-    build: .
-    container_name: strava-duckdb-ingest
+
+  api:
+    build:
+      context: .
+      dockerfile: ./src/api/Dockerfile
+    container_name: fast-api-app
     volumes:
-      # Data volume to persist the DuckDB file
       - ./data:/app/data
-      # Mount .env so secret keys are available
       - ./.env:/app/.env
-    # Interactive mode to allow browser launch or CLI interaction if needed
-    stdin_open: true
-    tty: true
-    # Run the script and then keep container alive for inspection if desired, or just run and exit.
-    # To keep alive: command: tail -f /dev/null
-    # Default is the CMD in Dockerfile: python ingest_strava_duckdb.py
+      - ./src/api:/app/src/api
+    ports:
+      - "8000:8000"
+    restart: always

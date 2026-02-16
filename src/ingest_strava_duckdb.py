@@ -4,6 +4,10 @@ import json
 import os
 import sys
 from dotenv import load_dotenv
+
+# Add project root to sys.path so we can import from src
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.fetch_strava_data import StravaManager
 
 # Connect to database (or create it)
@@ -184,6 +188,78 @@ class StravaDB:
         process_stream('altitude', 'altitude')
         process_stream('moving', 'moving')
 
+    def activity_exists(self, activity_id):
+        res = self.con.execute("SELECT 1 FROM dim_activity WHERE activity_id = ?", [activity_id]).fetchone()
+        return res is not None
+
+    def activity_has_streams(self, activity_id):
+        # Check if we have data in key stream tables (e.g. heartrate or velocity)
+        # Note: some activities might justifiably have no streams (manual entry), 
+        # but this checks if we attempted ingestion.
+        # A simple check is to see if there are any rows in any stream table for this id.
+        # We'll check velocity since it's most common.
+        res = self.con.execute("SELECT 1 FROM stream_velocity WHERE activity_id = ? LIMIT 1", [activity_id]).fetchone()
+        if res: return True
+        # Check heartrate
+        res = self.con.execute("SELECT 1 FROM stream_heartrate WHERE activity_id = ? LIMIT 1", [activity_id]).fetchone()
+        return res is not None
+
+def get_activities_missing_streams(manager, db, access_token):
+    """
+    Generator that yields activities that are in DB but missing streams.
+    This effectively re-scans history to backfill streams.
+    """
+    page = 1
+    per_page = 50 
+    
+    while True:
+        try:
+            activities = manager.fetch_activities(access_token, count=per_page, page=page)
+        except Exception as e:
+            # reuse auth logic if needed/abstract it, but simple catch for now
+            if "Unauthorized" in str(e):
+                 # ... (same auth logic) ...
+                 print(f"Unauthorized error on page {page}. Attempting to re-authenticate...")
+                 new_token = manager.run_oauth_flow()
+                 if new_token:
+                    access_token = new_token
+                    continue
+            print(f"Error fetching page {page}: {e}")
+            break
+            
+        if not activities:
+            break
+            
+        for activity in activities:
+            # If (New Activity) OR (Existing Activity AND Missing Streams)
+            exists = db.activity_exists(activity['id'])
+            if not exists:
+                yield activity, access_token, "new"
+            elif not db.activity_has_streams(activity['id']):
+                # Only yield if it's a type of activity that should have streams (e.g. not manual weight training if no device)
+                # But for now, we just try fetching.
+                yield activity, access_token, "missing_streams"
+        
+        # We must ignore the "stop if all found" logic because we are backfilling streams
+        # for potentially all historical activities.
+        # However, Strava API limits are real.
+        
+        if len(activities) < per_page:
+            break
+            
+        page += 1
+
+def check_missing_activities(manager, db, access_token):
+    """
+    Scans Strava history and reports count of activities not in DB or missing streams.
+    """
+    print("Scanning for missing activities/streams...")
+    count = 0
+    for _, _, _ in get_activities_missing_streams(manager, db, access_token):
+        count += 1
+    print(f"Found {count} activities needing processing.")
+    return count
+
 def main():
     manager = StravaManager()
     db = StravaDB()
@@ -208,16 +284,20 @@ def main():
     except Exception as e:
         print(f"Error fetching athlete: {e}")
 
-    # 2. Fetch Recent Activities
+    # 2. Ingest Activities (New or Missing Streams)
+    print("Starting ingestion of activities (New + Missing Streams)...")
     try:
-        # Fetch 10 most recent
-        activities = manager.fetch_activities(access_token, count=10)
-        print(f"Found {len(activities)} activities to process.")
+        # We use the combined generator
+        activity_gen = get_activities_missing_streams(manager, db, access_token)
         
-        for activity in activities:
-            print(f"Processing Activity: {activity['name']} ({activity['start_date_local']})...")
+        count = 0
+        for activity, current_token, reason in activity_gen:
+            # Update the access_token in main scope
+            access_token = current_token
             
-            # Upsert Dimension
+            print(f"Processing Activity ({reason}): {activity['name']} ({activity['start_date_local']})...")
+            
+            # Upsert Dimension (always safe to do)
             db.upsert_activity(activity)
             
             # Fetch Streams
@@ -228,8 +308,26 @@ def main():
                 else:
                     print("   No streams found.")
             except Exception as e:
-                print(f"   Error processing streams: {e}")
-                
+                # If we get Unauthorized here, it implies the token expired betweeen fetching activity and streams
+                if "Unauthorized" in str(e):
+                    print("   Unauthorized during stream fetch. Refreshing token...")
+                    access_token = manager.run_oauth_flow()
+                    if access_token:
+                        try:
+                            streams = manager.fetch_activity_streams(access_token, activity['id'], keys=STREAMS_TO_FETCH)
+                            if streams:
+                                db.insert_streams(activity['id'], streams)
+                            else:
+                                print("   No streams found (after refresh).")
+                        except Exception as inner_e:
+                            print(f"   Error processing streams (after refresh): {inner_e}")
+                else:
+                    print(f"   Error processing streams: {e}")
+            
+            count += 1
+            
+        print(f"Ingestion complete. Processed {count} activities.")
+
     except Exception as e:
         print(f"Error in batch process: {e}")
 

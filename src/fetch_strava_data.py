@@ -138,13 +138,13 @@ class StravaManager:
             print(f"Error refreshing token: {e}")
             return None
 
-    def fetch_activities(self, access_token, count=5):
+    def fetch_activities(self, access_token, count=5, page=1):
         """Fetches recent activities."""
         url = "https://www.strava.com/api/v3/athlete/activities"
         headers = {'Authorization': f'Bearer {access_token}'}
-        params = {'per_page': count}
+        params = {'per_page': count, 'page': page}
         
-        print(f"Fetching last {count} activities...")
+        print(f"Fetching activities (Page {page}, Count {count})...")
         response = requests.get(url, headers=headers, params=params)
         
         if response.status_code == 401:
