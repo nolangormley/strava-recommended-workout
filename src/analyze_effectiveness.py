@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 
 # Constants (You can adjust these or we can make them arguments)
-DEFAULT_MAX_HR = 190
+DEFAULT_MAX_HR = 192
 DEFAULT_REST_HR = 60
 IS_MALE = True # Needed for Banister's constant (b=1.92 for men, 1.67 for women)
 
@@ -71,10 +71,88 @@ def calculate_trimp_edwards(hr_series, max_hr):
     score = (np.sum(z1) * 1) + (np.sum(z2) * 2) + (np.sum(z3) * 3) + (np.sum(z4) * 4) + (np.sum(z5) * 5)
     return score / 60.0
 
+def calculate_time_in_zones(hr_series, max_hr):
+    """
+    Returns the time (in seconds) spent in each of the 5 Edwards zones.
+    """
+    if len(hr_series) == 0: return [0, 0, 0, 0, 0]
+    
+    hr_array = np.array(hr_series)
+    z1 = ((hr_array >= max_hr * 0.5) & (hr_array < max_hr * 0.6))
+    z2 = ((hr_array >= max_hr * 0.6) & (hr_array < max_hr * 0.7))
+    z3 = ((hr_array >= max_hr * 0.7) & (hr_array < max_hr * 0.8))
+    z4 = ((hr_array >= max_hr * 0.8) & (hr_array < max_hr * 0.9))
+    z5 = (hr_array >= max_hr * 0.9)
+    
+    # Assuming 1 second per point (approx)
+    return [int(np.sum(z1)), int(np.sum(z2)), int(np.sum(z3)), int(np.sum(z4)), int(np.sum(z5))]
+
+def calculate_aerobic_decoupling(hr_times, hr_values, vel_times, vel_values):
+    """
+    Calculates Aerobic Decoupling (Pa:HR ratio drift).
+    Decoupling = (EF_first_half - EF_second_half) / EF_first_half
+    Where EF (Efficiency Factor) = Avg Speed / Avg HR.
+    """
+    if not hr_values or not vel_values:
+        return None
+        
+    # Align data by converting to pandas series or dataframe for easier time-based indexing
+    # Create simple dataframes
+    df_hr = pd.DataFrame({'time': hr_times, 'hr': hr_values})
+    df_vel = pd.DataFrame({'time': vel_times, 'vel': vel_values})
+    
+    # Merge on time (approximate match or exact if streams are consistent)
+    # Strava streams usually have exact matching offsets if requested together
+    # But let's just use exact match on 'time'
+    df = pd.merge(df_hr, df_vel, on='time', how='inner')
+    
+    if len(df) < 60: # Too short to be meaningful
+        return None
+    
+    # Filter out stops (velocity near 0)
+    df = df[df['vel'] > 0.1] # moving only
+    
+    if len(df) < 60:
+        return None
+        
+    duration = df['time'].max()
+    midpoint = duration / 2
+    
+    first_half = df[df['time'] <= midpoint]
+    second_half = df[df['time'] > midpoint]
+    
+    if len(first_half) == 0 or len(second_half) == 0:
+        return None
+        
+    avg_hr1 = first_half['hr'].mean()
+    avg_vel1 = first_half['vel'].mean()
+    
+    avg_hr2 = second_half['hr'].mean()
+    avg_vel2 = second_half['vel'].mean()
+    
+    if avg_hr1 == 0 or avg_hr2 == 0:
+        return None
+        
+    # Calculate EF (Speed / HR)
+    # Using m/min for speed to make numbers nicer, though ratio is unitless essentially
+    ef1 = (avg_vel1 * 60) / avg_hr1
+    ef2 = (avg_vel2 * 60) / avg_hr2
+    
+    if ef1 == 0: return 0
+    
+    # TODO: Research how to handle negative decoupling (e.g., -5%).
+    # Currently it means efficiency IMPROVED in the second half (negative drift).
+    # This often happens during interval sets where rest periods lower average HR,
+    # or if the user significantly speeds up (negative split) without corresponding HR spike.
+    # Consider filtering out values < -10% or handling interval workouts differently.
+    return ((ef1 - ef2) / ef1) * 100
+
 def analyze_effectiveness():
     con = duckdb.connect(DB_PATH)
     
     # 1. Create Analysis Table
+    # Recreate to ensure schema update
+    con.execute("DROP TABLE IF EXISTS activity_effectiveness")
     con.execute("""
         CREATE TABLE IF NOT EXISTS activity_effectiveness (
             activity_id UBIGINT PRIMARY KEY,
@@ -82,6 +160,12 @@ def analyze_effectiveness():
             trimp_edwards DOUBLE,
             efficiency_factor DOUBLE, -- Speed/HR Ratio
             intensity_factor DOUBLE,  -- Avg HR / Max HR
+            aerobic_decoupling DOUBLE, -- Pa:HR Drift %
+            zone_1_sec INTEGER,
+            zone_2_sec INTEGER,
+            zone_3_sec INTEGER,
+            zone_4_sec INTEGER,
+            zone_5_sec INTEGER,
             effectiveness_score DOUBLE, -- Custom composite
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (activity_id) REFERENCES dim_activity(activity_id)
@@ -147,8 +231,9 @@ def analyze_effectiveness():
             trimp_b_sum += val
             prev_time = times[i]
             
-        # 2. Edwards TRIMP
+        # 2. Edwards TRIMP & Zones
         trimp_e = calculate_trimp_edwards(hr_values, user_max_hr)
+        zones = calculate_time_in_zones(hr_values, user_max_hr)
         
         # 3. Efficiency Factor (EF)
         # Normalized Speed (m/min) / Avg HR
@@ -158,20 +243,32 @@ def analyze_effectiveness():
         
         # 4. Intensity Factor (Simple)
         intensity = avg_hr / user_max_hr
+
+        # 5. Aerobic Decoupling
+        # Fetch velocity stream
+        vel_stream = con.execute(f"""
+            SELECT value, time_offset FROM stream_velocity WHERE activity_id = {act_id} ORDER BY time_offset
+        """).fetchall()
+        
+        decoupling = None
+        if vel_stream:
+            vel_values = [v[0] for v in vel_stream]
+            vel_times = [v[1] for v in vel_stream]
+            decoupling = calculate_aerobic_decoupling(times, hr_values, vel_times, vel_values)
         
         # Persist
+        # Persist
         con.execute("""
-            INSERT INTO activity_effectiveness (activity_id, trimp_banister, trimp_edwards, efficiency_factor, intensity_factor, effectiveness_score)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT (activity_id) DO UPDATE SET
-                trimp_banister = EXCLUDED.trimp_banister,
-                trimp_edwards = EXCLUDED.trimp_edwards,
-                efficiency_factor = EXCLUDED.efficiency_factor,
-                intensity_factor = EXCLUDED.intensity_factor,
-                effectiveness_score = EXCLUDED.effectiveness_score;
-        """, [act_id, trimp_b_sum, trimp_e, ef, intensity, trimp_b_sum])
+            INSERT INTO activity_effectiveness (
+                activity_id, trimp_banister, trimp_edwards, efficiency_factor, intensity_factor, 
+                aerobic_decoupling, zone_1_sec, zone_2_sec, zone_3_sec, zone_4_sec, zone_5_sec, 
+                effectiveness_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [act_id, trimp_b_sum, trimp_e, ef, intensity, decoupling, zones[0], zones[1], zones[2], zones[3], zones[4], trimp_b_sum])
         
-        print(f"Analyzed {name}: TRIMP(b)={trimp_b_sum:.1f}, TRIMP(e)={trimp_e:.1f}, EF={ef:.2f}")
+        decoupling_str = f"{decoupling:.1f}%" if decoupling is not None else "N/A"
+        print(f"Analyzed {name}: TRIMP(b)={trimp_b_sum:.1f}, EF={ef:.2f}, Decoup={decoupling_str}")
 
     # Summary Report
     print("\n" + "="*60)
@@ -184,18 +281,23 @@ def analyze_effectiveness():
             da.start_date_local, 
             ae.trimp_banister, 
             ae.trimp_edwards, 
-            ae.efficiency_factor
+            ae.efficiency_factor,
+            ae.aerobic_decoupling,
+            ae.zone_5_sec
         FROM activity_effectiveness ae
         JOIN dim_activity da ON ae.activity_id = da.activity_id
-        ORDER BY ae.trimp_banister DESC
+        ORDER BY da.start_date_local DESC
+        LIMIT 20
     """).fetchall()
     
-    print(f"{'Activity':<25} | {'Date':<10} | {'Banister':<8} | {'Edwards':<8} | {'EF (m/beat)':<10}")
-    print("-" * 75)
+    print(f"{'Activity':<25} | {'Date':<10} | {'Banister':<8} | {'EF':<5} | {'Decoup':<7} | {'Z5 (min)':<8}")
+    print("-" * 80)
     for res in results:
         name = (res[0][:22] + '..') if len(res[0]) > 22 else res[0]
         date = str(res[2])[:10]
-        print(f"{name:<25} | {date:<10} | {res[3]:<8.1f} | {res[4]:<8.1f} | {res[5]:<10.2f}")
+        decoup = f"{res[6]:.1f}%" if res[6] is not None else "-"
+        z5_min = round(res[7]/60, 1) if res[7] else 0
+        print(f"{name:<25} | {date:<10} | {res[3]:<8.1f} | {res[5]:<5.2f} | {decoup:<7} | {z5_min:<8}")
 
 if __name__ == "__main__":
     analyze_effectiveness()

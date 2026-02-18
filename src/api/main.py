@@ -5,8 +5,20 @@ import numpy as np
 from datetime import datetime
 import os
 import random
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
+
+# Groq Client
+groq_client = None
+api_key = os.getenv("GROQ_API_KEY")
+if api_key:
+    groq_client = Groq(api_key=api_key)
+else:
+    print("Warning: GROQ_API_KEY not found. AI insights will be disabled.")
 
 # Database Path
 # Docker: /app/data/strava_warehouse.duckdb
@@ -50,7 +62,9 @@ def calculate_training_status_logic(user_id: int):
         df = con.execute("""
             SELECT 
                 da.start_date_local::DATE as activity_date,
-                SUM(ae.trimp_banister) as daily_load
+                SUM(ae.trimp_banister) as daily_load,
+                AVG(ae.efficiency_factor) as daily_ef,
+                AVG(ae.aerobic_decoupling) as daily_decoup
             FROM activity_effectiveness ae
             JOIN dim_activity da ON ae.activity_id = da.activity_id
             WHERE da.athlete_id = ?
@@ -101,6 +115,10 @@ def calculate_training_status_logic(user_id: int):
     merged['ATL'] = atl[1:]
     merged['TSB'] = merged['CTL'] - merged['ATL']
     
+    # Calculate Rolling Averages for Insights (7-day)
+    merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
+    merged['Decoup_7d'] = merged['daily_decoup'].rolling(window=7, min_periods=1).mean()
+    
     today_stats = merged.iloc[-1]
     tsb = today_stats['TSB']
 
@@ -114,19 +132,71 @@ def calculate_training_status_logic(user_id: int):
     else:
         target_category = "Recovery"
     
+    # Helper to clean NNs for JSON
+    def clean_val(val, decimals=1):
+        if pd.isna(val) or val is None: return None
+        return round(float(val), decimals)
+
     return {
         "date": str(today_stats['date']),
-        "fitness_ctl": round(float(today_stats['CTL']), 1),
-        "fatigue_atl": round(float(today_stats['ATL']), 1),
-        "form_tsb": round(float(today_stats['TSB']), 1),
-        "target_category": target_category
+        "fitness_ctl": clean_val(today_stats['CTL']),
+        "fatigue_atl": clean_val(today_stats['ATL']),
+        "form_tsb":    clean_val(today_stats['TSB']),
+        "target_category": target_category,
+        "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
+        "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
+        "latest_daily_ef": clean_val(today_stats.get('daily_ef'), 2),
+        "latest_daily_decoup": clean_val(today_stats.get('daily_decoup'), 1)
     }
+
+def get_ai_insight(stats, context="status", workout=None):
+    if not groq_client: return None
+    
+    try:
+        # Construct Prompt
+        if context == "status":
+            prompt = (
+                f"Analyze the following athlete's training status based on these metrics:\n"
+                f"- Fitness (CTL): {stats.get('fitness_ctl')} (Chronic Load)\n"
+                f"- Fatigue (ATL): {stats.get('fatigue_atl')} (Acute Load)\n"
+                f"- Form (TSB): {stats.get('form_tsb')} (Balance)\n"
+                f"- Efficiency Factor (7-day avg): {stats.get('efficiency_factor_7d')}\n"
+                f"- Aerobic Decoupling (7-day avg): {stats.get('aerobic_decoupling_7d')}%\n"
+                f"\nProvide a concise, 2-3 sentence interpretation of their current physical state and what they should focus on. "
+                f"Be direct and sound like a professional coach and talk directly to them."
+            )
+        elif context == "workout":
+            prompt = (
+                f"The athlete has a TSB of {stats.get('form_tsb')} (Category: {stats.get('target_category')}).\n"
+                f"We are recommending this workout: {workout.get('name')} ({workout.get('category')}).\n"
+                f"Description: {workout.get('description')}\n"
+                f"\nBriefly explain why this specific workout is appropriate for their current state (TSB {stats.get('form_tsb')}). "
+                f"Keep it under 3 sentences and talk directly to them."
+            )
+            
+        completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are an expert endurance coach."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.5,
+            max_tokens=150
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        print(f"Error getting AI insight: {e}")
+        return None
 
 @app.get("/status/{user_id}")
 def get_status(user_id: int):
     status = calculate_training_status_logic(user_id)
     if not status:
         raise HTTPException(status_code=404, detail="No training data found for user (Did you run analyze_effectiveness.py?)")
+    
+    # Add AI Insight
+    status['ai_insight'] = get_ai_insight(status, context="status")
+    
     return status
 
 @app.get("/recommend/{user_id}")
@@ -176,14 +246,20 @@ def get_recommendation(user_id: int):
 
     w = random.choice(workouts)
     
-    return {
-        "user_id": user_id,
-        "current_tsb": tsb,
-        "recommended_category": target_category,
-        "workout": {
+    w_dict = {
             "name": w[0],
             "description": w[1],
             "url": w[2],
             "category": w[3]
         }
+    
+    # Add AI Reasoning
+    ai_reasoning = get_ai_insight(status, context="workout", workout=w_dict)
+    
+    return {
+        "user_id": user_id,
+        "current_tsb": tsb,
+        "recommended_category": target_category,
+        "ai_reasoning": ai_reasoning,
+        "workout": w_dict
     }

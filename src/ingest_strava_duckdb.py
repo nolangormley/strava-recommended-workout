@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from dotenv import load_dotenv
+import time
 
 # Add project root to sys.path so we can import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -204,17 +205,25 @@ class StravaDB:
         res = self.con.execute("SELECT 1 FROM stream_heartrate WHERE activity_id = ? LIMIT 1", [activity_id]).fetchone()
         return res is not None
 
-def get_activities_missing_streams(manager, db, access_token):
+def get_activities_missing_streams(manager, db, access_token, days_lookback=14):
     """
     Generator that yields activities that are in DB but missing streams.
     This effectively re-scans history to backfill streams.
+    Default lookback is 14 days. Set days_lookback=None for all time.
     """
     page = 1
     per_page = 50 
     
+    # Calculate after_timestamp if days_lookback is set
+    after_timestamp = None
+    if days_lookback:
+        # Current time - days * 24 * 60 * 60
+        after_timestamp = int(time.time() - (days_lookback * 24 * 60 * 60))
+        print(f"Fetching activities after timestamp: {after_timestamp} (~{days_lookback} days ago)")
+
     while True:
         try:
-            activities = manager.fetch_activities(access_token, count=per_page, page=page)
+            activities = manager.fetch_activities(access_token, count=per_page, page=page, after=after_timestamp)
         except Exception as e:
             # reuse auth logic if needed/abstract it, but simple catch for now
             if "Unauthorized" in str(e):

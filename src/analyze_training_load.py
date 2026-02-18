@@ -14,7 +14,9 @@ def calculate_training_load():
     df = con.execute("""
         SELECT 
             da.start_date_local::DATE as activity_date,
-            SUM(ae.trimp_banister) as daily_load
+            SUM(ae.trimp_banister) as daily_load,
+            AVG(ae.efficiency_factor) as daily_ef,
+            AVG(ae.aerobic_decoupling) as daily_decoup
         FROM activity_effectiveness ae
         JOIN dim_activity da ON ae.activity_id = da.activity_id
         GROUP BY 1
@@ -73,7 +75,13 @@ def calculate_training_load():
     # Remove initial seed
     merged['CTL'] = ctl[1:]
     merged['ATL'] = atl[1:]
+    merged['CTL'] = ctl[1:]
+    merged['ATL'] = atl[1:]
     merged['TSB'] = merged['CTL'] - merged['ATL']
+    
+    # Calculate Rolling Averages for Insights (7-day)
+    merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
+    merged['Decoup_7d'] = merged['daily_decoup'].rolling(window=7, min_periods=1).mean()
     
     # 4. Display Status
     print("\n" + "="*60)
@@ -113,6 +121,17 @@ def calculate_training_load():
         print("    -> Recommended: REST DAY or active recovery (Zone 1 spin/jog).")
         category = "Recovery"
 
+    # 5b. Aerobic Insights
+    avg_decoup = today_stats.get('Decoup_7d', 0)
+    avg_ef = today_stats.get('EF_7d', 0)
+    
+    if avg_decoup > 5.0:
+        print("[!] Aerobic Decoupling High (> 5%).")
+        print("    -> Your heart rate is drifting significantly on runs.")
+        print("    -> Focus on long, slow distance (Base) to improve efficiency.")
+    
+    print(f"    (7-day Avg EF: {avg_ef:.2f} | 7-day Avg Decoupling: {avg_decoup:.1f}%)")
+
     # 6. Specific Workout Recommendation (Wrapper)
     print("\n" + "="*60)
     print("RECOMMENDED WORKOUT (from Coros Library)")
@@ -150,13 +169,15 @@ def calculate_training_load():
 
     # 7. Recent History Table
     print("\nRecent History (Last 7 Days):")
-    print(f"{'Date':<12} | {'Load':<6} | {'Fitness':<8} | {'Fatigue':<8} | {'Form':<6}")
-    print("-" * 50)
+    print(f"{'Date':<10} | {'Load':<5} | {'Fitness':<7} | {'Fatigue':<7} | {'Form':<5} | {'EF':<4} | {'Decoup':<6}")
+    print("-" * 70)
     
     recent = merged.tail(7)
     for index, row in recent.iterrows():
         d = row['date'].strftime("%m-%d")
-        print(f"{d:<12} | {row['daily_load']:<6.0f} | {row['CTL']:<8.1f} | {row['ATL']:<8.1f} | {row['TSB']:<6.1f}")
+        ef_val = f"{row['daily_ef']:.2f}" if row['daily_ef'] > 0 else "-"
+        decoup_val = f"{row['daily_decoup']:.1f}%" if pd.notna(row['daily_decoup']) else "-"
+        print(f"{d:<10} | {row['daily_load']:<5.0f} | {row['CTL']:<7.1f} | {row['ATL']:<7.1f} | {row['TSB']:<5.1f} | {ef_val:<4} | {decoup_val:<6}")
 
 if __name__ == "__main__":
     calculate_training_load()
