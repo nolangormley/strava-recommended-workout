@@ -5,20 +5,12 @@ import numpy as np
 from datetime import datetime
 import os
 import random
-from groq import Groq
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = FastAPI()
-
-# Groq Client
-groq_client = None
-api_key = os.getenv("GROQ_API_KEY")
-if api_key:
-    groq_client = Groq(api_key=api_key)
-else:
-    print("Warning: GROQ_API_KEY not found. AI insights will be disabled.")
 
 # Database Path
 # Docker: /app/data/strava_warehouse.duckdb
@@ -137,6 +129,19 @@ def calculate_training_status_logic(user_id: int):
         if pd.isna(val) or val is None: return None
         return round(float(val), decimals)
 
+    # Get Last 7 days history
+    history_df = merged.tail(7)
+    history_list = []
+    for _, row in history_df.iterrows():
+        history_list.append({
+            "date": str(row['date']),
+            "fitness": clean_val(row['CTL']),
+            "fatigue": clean_val(row['ATL']),
+            "form": clean_val(row['TSB']),
+            "daily_ef": clean_val(row['daily_ef'], 2),
+            "daily_decoup": clean_val(row['daily_decoup'], 1)
+        })
+
     return {
         "date": str(today_stats['date']),
         "fitness_ctl": clean_val(today_stats['CTL']),
@@ -146,44 +151,65 @@ def calculate_training_status_logic(user_id: int):
         "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
         "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
         "latest_daily_ef": clean_val(today_stats.get('daily_ef'), 2),
-        "latest_daily_decoup": clean_val(today_stats.get('daily_decoup'), 1)
+        "latest_daily_decoup": clean_val(today_stats.get('daily_decoup'), 1),
+        "history": history_list
     }
 
 def get_ai_insight(stats, context="status", workout=None):
-    if not groq_client: return None
-    
     try:
+        history_str = "\n".join([f"  - {h['date']}: Form (TSB): {h['form']}, Load (ATL): {h['fatigue']}" for h in stats.get('history', [])])
+
         # Construct Prompt
         if context == "status":
             prompt = (
-                f"Analyze the following athlete's training status based on these metrics:\n"
-                f"- Fitness (CTL): {stats.get('fitness_ctl')} (Chronic Load)\n"
-                f"- Fatigue (ATL): {stats.get('fatigue_atl')} (Acute Load)\n"
-                f"- Form (TSB): {stats.get('form_tsb')} (Balance)\n"
-                f"- Efficiency Factor (7-day avg): {stats.get('efficiency_factor_7d')}\n"
-                f"- Aerobic Decoupling (7-day avg): {stats.get('aerobic_decoupling_7d')}%\n"
-                f"\nProvide a concise, 2-3 sentence interpretation of their current physical state and what they should focus on. "
-                f"Be direct and sound like a professional coach and talk directly to them."
+                f"Analyze the athlete's current training status and give a 2-3 sentence recommendation on what they should focus on.\n\n"
+                f"Current Metrics:\n"
+                f"- Fitness (CTL, 42-day moving average - higher means fitter): {stats.get('fitness_ctl')}\n"
+                f"- Fatigue (ATL, 7-day avg load - higher means more tired): {stats.get('fatigue_atl')}\n"
+                f"- Form (TSB, Fitness minus Fatigue - negative means fatigued, positive means rested): {stats.get('form_tsb')}\n"
+                f"- Efficiency Factor 7d Avg (EF, higher is better aerobic efficiency): {stats.get('efficiency_factor_7d')}\n"
+                f"- Aerobic Decoupling 7d Avg (Heart rate drift, lower is better, <5% is great): {stats.get('aerobic_decoupling_7d')}%\n\n"
+                f"Recent 7 Day Trend:\n{history_str}\n\n"
+                f"Talk directly to them as an expert endurance coach. Be concise and provide actionable advice based on their current load, form, and aerobic efficiency."
             )
         elif context == "workout":
             prompt = (
-                f"The athlete has a TSB of {stats.get('form_tsb')} (Category: {stats.get('target_category')}).\n"
+                f"The athlete currently has a Form/TSB of {stats.get('form_tsb')} (Negative TSB means fatigued/in heavy training, positive means rested/tapering).\n"
+                f"Their 7-day Aerobic Decoupling is {stats.get('aerobic_decoupling_7d')}% (Under 5% indicates good base aerobic fitness).\n\n"
                 f"We are recommending this workout: {workout.get('name')} ({workout.get('category')}).\n"
-                f"Description: {workout.get('description')}\n"
-                f"\nBriefly explain why this specific workout is appropriate for their current state (TSB {stats.get('form_tsb')}). "
-                f"Keep it under 3 sentences and talk directly to them."
+                f"Description: {workout.get('description')}\n\n"
+                f"Briefly explain in 2-3 sentences why this specific workout is appropriate for their current training state, acting as their professional endurance coach. Talk directly to them."
             )
             
-        completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are an expert endurance coach."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.5,
-            max_tokens=150
-        )
-        return completion.choices[0].message.content
+        # Call LM Studio local API
+        url = "http://localhost:1234/api/v1/chat"
+            
+        payload = {
+            "model": "mistralai/ministral-3-3b",
+            "system_prompt": "You are an expert running coach and one of your athletes is training for a half marathon that is on May 2nd 2026. The athlete is 28, is 5'11 and weighs 220lbs. His goal is to run a sub 2 hour half marathon. Explain what the metrics mean in a concise way and give actionable advice.",
+            "input": prompt
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        # Assuming the response format matches the custom local LM studio formats
+        data = response.json()
+        if "choices" in data and len(data["choices"]) > 0 and "message" in data["choices"][0]:
+            return data["choices"][0]["message"]["content"]
+        elif "output" in data and len(data["output"]) > 0 and "content" in data["output"][0]:
+            return data["output"][0]["content"]
+        elif "message" in data:
+            return data["message"]
+        elif "response" in data:
+            return data["response"]
+        else:
+            return str(data)
+            
+    except Exception as e:
+        print(f"Error getting AI insight: {e}")
+        return None
     except Exception as e:
         print(f"Error getting AI insight: {e}")
         return None
@@ -205,7 +231,8 @@ def get_recommendation(user_id: int):
     if not status:
         raise HTTPException(status_code=404, detail="No training data found for user")
     
-    tsb = status['form_tsb']
+    tsb_val = status.get('form_tsb')
+    tsb = float(tsb_val) if tsb_val is not None else 0.0
     
     # Map TSB to Category
     if tsb > 5:

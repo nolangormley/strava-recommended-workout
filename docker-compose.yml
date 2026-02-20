@@ -11,6 +11,5 @@ services:
       - ./data:/app/data
       - ./.env:/app/.env
       - ./src/api:/app/src/api
-    ports:
-      - "8000:8000"
+    network_mode: "host"
     restart: always
