@@ -10,6 +10,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env
-      - ./src/api:/app/src/api
+      - ./src:/app/src
     network_mode: "host"
     restart: always
