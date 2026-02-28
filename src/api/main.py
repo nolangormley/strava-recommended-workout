@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-from src.metrics import calculate_ctl_atl, calculate_tsb, get_target_category, calculate_vo2max_from_df, clean_val
+from src.metrics import calculate_ctl_atl, calculate_tsb, get_target_category, calculate_vo2max_from_df, clean_val, calculate_acwr
 
 load_dotenv()
 
@@ -111,6 +111,7 @@ def calculate_training_status_logic(user_id: int):
     merged['CTL'] = ctl
     merged['ATL'] = atl
     merged['TSB'] = calculate_tsb(merged['CTL'], merged['ATL'])
+    merged['ACWR'] = calculate_acwr(merged['CTL'], merged['ATL'])
     
     # Calculate Rolling Averages for Insights (7-day)
     merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
@@ -129,6 +130,16 @@ def calculate_training_status_logic(user_id: int):
     # Get VO2 Max estimate
     vo2max_data = calculate_vo2max(user_id)
     latest_vo2_max = vo2max_data.get('latest_vo2_max') if vo2max_data else None
+    
+    # Get Athlete Info
+    try:
+        athlete_data = con.execute("SELECT weight, sex FROM dim_athlete WHERE athlete_id = ?", [user_id]).fetchone()
+        weight_kg = athlete_data[0] if athlete_data else None
+        weight_lbs = round(weight_kg * 2.20462) if weight_kg else None
+        sex = athlete_data[1] if athlete_data else None
+    except:
+        weight_lbs = None
+        sex = None
 
     # Get Last 7 days history
     history_df = merged.tail(7)
@@ -148,12 +159,15 @@ def calculate_training_status_logic(user_id: int):
         "fitness_ctl": clean_val(today_stats['CTL']),
         "fatigue_atl": clean_val(today_stats['ATL']),
         "form_tsb":    clean_val(today_stats['TSB']),
+        "acwr":        clean_val(today_stats['ACWR'], 2),
         "target_category": target_category,
         "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
         "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
         "latest_daily_ef": clean_val(today_stats.get('latest_ef'), 2),
         "latest_daily_decoup": clean_val(today_stats.get('latest_decoup'), 1),
         "latest_vo2_max": latest_vo2_max,
+        "weight_lbs": weight_lbs,
+        "sex": sex,
         "history": history_list
     }
 
@@ -164,16 +178,15 @@ def get_ai_insight(stats, context="status", workout=None):
         # Construct Prompt
         if context == "status":
             prompt = (
-                f"Analyze the athlete's current training status and give a 2-3 sentence recommendation on what they should focus on.\n\n"
-                f"Current Metrics:\n"
-                f"- Fitness (CTL, 42-day moving average - higher means fitter): {stats.get('fitness_ctl')}\n"
-                f"- Fatigue (ATL, 7-day avg load - higher means more tired): {stats.get('fatigue_atl')}\n"
-                f"- Form (TSB, Fitness minus Fatigue - negative means fatigued, positive means rested. During hard training, a TSB of -10 to -30 is common. -30 or lower indicates high risk of injury): {stats.get('form_tsb')}\n"
+                f"Explain the user's current training status based on these metrics:\n"
+                f"- Fitness (CTL): {stats.get('fitness_ctl')}\n"
+                f"- Fatigue (ATL): {stats.get('fatigue_atl')}\n"
+                f"- Form (TSB): {stats.get('form_tsb')} (Target: {stats.get('target_category')})\n"
+                f"- Acute-to-Chronic Workload Ratio (ACWR): {stats.get('acwr')}\n"
                 f"- Estimated VO2 Max: {stats.get('latest_vo2_max', 'N/A')}\n"
-                f"- Efficiency Factor 7d Avg (EF, higher is better aerobic efficiency): {stats.get('efficiency_factor_7d')}\n"
-                f"- Aerobic Decoupling 7d Avg (Heart rate drift, lower is better, <5% is great): {stats.get('aerobic_decoupling_7d')}%\n\n"
-                f"Recent 7 Day Trend:\n{history_str}\n\n"
-                f"Talk directly to them as an expert endurance coach. Be concise and provide actionable advice based on their current load, form, and aerobic efficiency."
+                f"- 7-Day Efficiency Factor: {stats.get('efficiency_factor_7d')}\n"
+                f"- 7-Day Aerobic Decoupling: {stats.get('aerobic_decoupling_7d')}%\n\n"
+                f"Give a short assessment of their readiness. Mention their ACWR: the sweet spot for injury prevention is 0.8-1.3, while over 1.5 is the danger zone. Give actionable advice."
             )
         elif context == "workout":
             prompt = (
@@ -186,7 +199,13 @@ def get_ai_insight(stats, context="status", workout=None):
             )
             
         llm_provider = os.getenv("LLM_PROVIDER", "local").lower()
-        system_prompt = "You are an expert running coach and one of your athletes is training for a half marathon that is on May 2nd 2026. The athlete is 28, is 5'11 and weighs 220lbs. His goal is to run a sub 2 hour half marathon. Explain what the metrics mean in a concise way and give actionable advice. Allow a bit of overtraining, they are very committed and love to push themselves. Don't be too conservative with the advice."
+        
+        weight_str = f"weighs {stats.get('weight_lbs')}lbs" if stats.get('weight_lbs') else "weighs 220lbs"
+        sex_str = stats.get('sex', 'male')
+        if sex_str == 'M': sex_str = 'male'
+        elif sex_str == 'F': sex_str = 'female'
+        
+        system_prompt = f"You are an expert running coach and one of your athletes is training for a half marathon that is on May 2nd 2026. The athlete is 28, is 5'11, {sex_str}, and {weight_str}. Their goal is to run a sub 2 hour half marathon. Explain what the metrics mean in a concise way and give actionable advice. Allow a bit of overtraining, they are very committed and love to push themselves. Don't be too conservative with the advice."
 
         if llm_provider == "groq":
             groq_api_key = os.getenv("GROQ_API_KEY")
@@ -312,7 +331,9 @@ def get_recommendation(user_id: int):
     return {
         "user_id": user_id,
         "current_tsb": tsb,
+        "current_acwr": status.get("acwr"),
         "recommended_category": target_category,
+        "latest_vo2_max": status.get("latest_vo2_max"),
         "ai_reasoning": ai_reasoning,
         "workout": w_dict
     }

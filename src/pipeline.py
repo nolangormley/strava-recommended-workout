@@ -118,9 +118,15 @@ class StravaDB:
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS dim_athlete (
                 athlete_id UBIGINT PRIMARY KEY, username VARCHAR, firstname VARCHAR, lastname VARCHAR,
-                city VARCHAR, state VARCHAR, country VARCHAR, sex VARCHAR, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                city VARCHAR, state VARCHAR, country VARCHAR, sex VARCHAR, weight DOUBLE, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        try:
+            self.con.execute("ALTER TABLE dim_athlete ADD COLUMN weight DOUBLE;")
+        except duckdb.CatalogException:
+            pass
+        except duckdb.BinderException:
+            pass
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS dim_activity (
                 activity_id UBIGINT PRIMARY KEY, athlete_id UBIGINT, name VARCHAR, type VARCHAR,
@@ -144,9 +150,9 @@ class StravaDB:
 
     def upsert_athlete(self, a):
         self.con.execute("""
-            INSERT INTO dim_athlete (athlete_id, username, firstname, lastname, city, state, country, sex) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (athlete_id) DO UPDATE SET username=EXCLUDED.username, firstname=EXCLUDED.firstname, lastname=EXCLUDED.lastname, city=EXCLUDED.city, state=EXCLUDED.state, country=EXCLUDED.country, sex=EXCLUDED.sex, updated_at=now();
-        """, [a.get('id'), a.get('username'), a.get('firstname'), a.get('lastname'), a.get('city'), a.get('state'), a.get('country'), a.get('sex')])
+            INSERT INTO dim_athlete (athlete_id, username, firstname, lastname, city, state, country, sex, weight) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (athlete_id) DO UPDATE SET username=EXCLUDED.username, firstname=EXCLUDED.firstname, lastname=EXCLUDED.lastname, city=EXCLUDED.city, state=EXCLUDED.state, country=EXCLUDED.country, sex=EXCLUDED.sex, weight=EXCLUDED.weight, updated_at=now();
+        """, [a.get('id'), a.get('username'), a.get('firstname'), a.get('lastname'), a.get('city'), a.get('state'), a.get('country'), a.get('sex'), a.get('weight')])
 
     def upsert_activity(self, a):
         self.con.execute("""
@@ -174,16 +180,18 @@ class StravaDB:
     def activity_exists(self, act_id): return self.con.execute("SELECT 1 FROM dim_activity WHERE activity_id = ?", [act_id]).fetchone() is not None
     def activity_has_streams(self, act_id): return self.con.execute("SELECT 1 FROM stream_velocity WHERE activity_id = ? LIMIT 1", [act_id]).fetchone() is not None
 
-def ingest_data(manager, db, access_token):
+def ingest_data(manager, db, access_token, days_lookback=42):
     try:
         athlete = requests.get("https://www.strava.com/api/v3/athlete", headers={'Authorization': f'Bearer {access_token}'}).json()
         db.upsert_athlete(athlete)
     except: pass
 
+    after_timestamp = int(time.time() - (days_lookback * 24 * 60 * 60))
+
     page = 1
     processed_count = 0
     while True:
-        try: activities = manager.fetch_activities(access_token, count=50, page=page)
+        try: activities = manager.fetch_activities(access_token, count=50, page=page, after=after_timestamp)
         except Exception as e:
             if "Unauthorized" in str(e):
                 access_token = manager.run_oauth_flow()
@@ -244,22 +252,23 @@ def run_analyze_effectiveness(db):
     con.execute("DROP TABLE IF EXISTS activity_effectiveness")
     con.execute("CREATE TABLE IF NOT EXISTS activity_effectiveness (activity_id UBIGINT PRIMARY KEY, trimp_banister DOUBLE, trimp_edwards DOUBLE, efficiency_factor DOUBLE, intensity_factor DOUBLE, aerobic_decoupling DOUBLE, zone_1_sec INTEGER, zone_2_sec INTEGER, zone_3_sec INTEGER, zone_4_sec INTEGER, zone_5_sec INTEGER, effectiveness_score DOUBLE, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (activity_id) REFERENCES dim_activity(activity_id));")
     
-    acts = con.execute("SELECT da.activity_id, da.name, da.start_date_local, da.max_heartrate, da.average_speed FROM dim_activity da JOIN stream_heartrate sh ON da.activity_id = sh.activity_id GROUP BY 1,2,3,4,5").fetchall()
+    acts = con.execute("SELECT da.activity_id, da.name, da.start_date_local, da.max_heartrate, da.average_speed, ath.sex FROM dim_activity da JOIN stream_heartrate sh ON da.activity_id = sh.activity_id JOIN dim_athlete ath ON da.athlete_id = ath.athlete_id GROUP BY 1,2,3,4,5,6").fetchall()
     
     processed = 0
-    for act_id, name, date, rep_max_hr, avg_speed in acts:
+    for act_id, name, date, rep_max_hr, avg_speed, sex in acts:
         hr_data = con.execute(f"SELECT value, time_offset FROM stream_heartrate WHERE activity_id = {act_id} ORDER BY time_offset").fetchall()
         if not hr_data: continue
         hr_vals, times = [h[0] for h in hr_data], [h[1] for h in hr_data]
         user_max_hr = rep_max_hr if (rep_max_hr and rep_max_hr > 150) else 192
         avg_hr = sum(hr_vals) / len(hr_vals)
         
+        is_male = (sex == 'M')
         trimp_b = 0
         prev_t = times[0]
         for i in range(1, len(hr_vals)):
             dt = (times[i] - prev_t) / 60.0
             if dt > 5: dt = 0
-            trimp_b += calculate_trimp_banister(dt * 60, hr_vals[i], user_max_hr, 60, True)
+            trimp_b += calculate_trimp_banister(dt * 60, hr_vals[i], user_max_hr, 60, is_male)
             prev_t = times[i]
             
         trimp_e = calculate_trimp_edwards(hr_vals, user_max_hr)

@@ -27,6 +27,17 @@ def calculate_tsb(ctl, atl):
         return [c - a for c, a in zip(ctl, atl)]
     return ctl - atl
 
+def calculate_acwr(ctl, atl):
+    """
+    Calculates Acute-to-Chronic Workload Ratio (ACWR) from CTL and ATL.
+    Also known as ATL/CTL. Returns 0 if CTL is 0.
+    """
+    if isinstance(ctl, pd.Series) and isinstance(atl, pd.Series):
+         return np.where(ctl > 0, atl / ctl, 0.0)
+    if isinstance(ctl, list) and isinstance(atl, list):
+        return [(a / c if c > 0 else 0.0) for c, a in zip(ctl, atl)]
+    return atl / ctl if ctl > 0 else 0.0
+
 def get_target_category(tsb):
     """
     Maps TSB to a target training category.

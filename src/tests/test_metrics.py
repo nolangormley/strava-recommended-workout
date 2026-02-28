@@ -1,7 +1,7 @@
 import pytest
 import pandas as pd
 import numpy as np
-from src.metrics import calculate_ctl_atl, calculate_tsb, get_target_category, calculate_vo2max_from_df, clean_val
+from src.metrics import calculate_ctl_atl, calculate_tsb, get_target_category, calculate_vo2max_from_df, clean_val, calculate_acwr
 
 def test_calculate_ctl_atl():
     loads = [100.0, 50.0, 150.0]
@@ -21,6 +21,15 @@ def test_calculate_tsb():
 def test_calculate_tsb_scalar():
     tsb = calculate_tsb(50.0, 70.0)
     assert tsb == -20.0
+
+def test_calculate_acwr():
+    # scalar division
+    assert calculate_acwr(50.0, 70.0) == 1.4
+    # zero ctl handles safely
+    assert calculate_acwr(0.0, 50.0) == 0.0
+    # list division
+    acwr = calculate_acwr([50.0, 0.0], [70.0, 50.0])
+    assert acwr == [1.4, 0.0]
 
 def test_get_target_category():
     assert get_target_category(10) == "Anaerobic"
