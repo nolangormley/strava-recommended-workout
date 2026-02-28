@@ -8,7 +8,7 @@ import time
 import duckdb
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv, set_key
@@ -81,18 +81,26 @@ class StravaManager:
 
     def get_access_token(self):
         refresh_token = os.getenv('STRAVA_REFRESH_TOKEN')
-        if not refresh_token: return self.run_oauth_flow()
+        if not refresh_token:
+            print("No refresh token found. Starting OAuth flow...")
+            return self.run_oauth_flow()
         try:
+            print("Refreshing access token...")
             resp = requests.post("https://www.strava.com/oauth/token", data={
                 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'refresh_token': refresh_token, 'grant_type': 'refresh_token'
             })
-            if resp.status_code in [400, 401]: return self.run_oauth_flow()
+            if resp.status_code in [400, 401]:
+                print(f"Refresh token invalid (status {resp.status_code}). Starting OAuth flow...")
+                return self.run_oauth_flow()
             resp.raise_for_status()
             data = resp.json()
             if data.get('refresh_token') and data['refresh_token'] != refresh_token:
+                print("New refresh token received, saving...")
                 self.save_refresh_token(data['refresh_token'])
             return data['access_token']
-        except Exception as e: return None
+        except Exception as e:
+            print(f"Error getting access token: {e}")
+            return None
 
     def fetch_activities(self, access_token, count=5, page=1, after=None):
         params = {'per_page': count, 'page': page}
@@ -103,9 +111,12 @@ class StravaManager:
         return resp.json()
 
     def fetch_activity_streams(self, access_token, activity_id, keys=STREAMS_TO_FETCH):
+        print(f"  Fetching streams for activity {activity_id}...")
         resp = requests.get(f"https://www.strava.com/api/v3/activities/{activity_id}/streams", headers={'Authorization': f'Bearer {access_token}'}, params={'keys': ",".join(keys), 'key_by_type': 'true'})
         if resp.status_code == 401: raise Exception("Unauthorized")
-        if resp.status_code == 404: return None
+        if resp.status_code == 404:
+            print(f"  Streams not found for activity {activity_id}")
+            return None
         resp.raise_for_status()
         return resp.json()
 
@@ -180,42 +191,75 @@ class StravaDB:
     def activity_exists(self, act_id): return self.con.execute("SELECT 1 FROM dim_activity WHERE activity_id = ?", [act_id]).fetchone() is not None
     def activity_has_streams(self, act_id): return self.con.execute("SELECT 1 FROM stream_velocity WHERE activity_id = ? LIMIT 1", [act_id]).fetchone() is not None
 
-def ingest_data(manager, db, access_token, days_lookback=42):
+def ingest_data(manager, db, access_token, lookback_days=42):
+    after_ts = int((datetime.now() - timedelta(days=lookback_days)).timestamp())
+    print(f"Limiting ingestion to activities after {datetime.fromtimestamp(after_ts)} ({lookback_days} days lookback)")
+    
     try:
+        print("Fetching athlete profile...")
         athlete = requests.get("https://www.strava.com/api/v3/athlete", headers={'Authorization': f'Bearer {access_token}'}).json()
         db.upsert_athlete(athlete)
-    except: pass
+        print(f"Athlete: {athlete.get('firstname')} {athlete.get('lastname')}")
+    except Exception as e:
+        print(f"Warning: Could not fetch athlete profile: {e}")
 
-    after_timestamp = int(time.time() - (days_lookback * 24 * 60 * 60))
+    after_timestamp = int(time.time() - (lookback_days * 24 * 60 * 60))
 
     page = 1
     processed_count = 0
     while True:
-        try: activities = manager.fetch_activities(access_token, count=50, page=page, after=after_timestamp)
+        print(f"Fetching activities page {page}...")
+        try:
+            activities = manager.fetch_activities(access_token, count=50, page=page, after=after_ts)
         except Exception as e:
+            print(f"Error fetching activities on page {page}: {e}")
             if "Unauthorized" in str(e):
+                print("Token expired during ingest, re-authenticating...")
                 access_token = manager.run_oauth_flow()
                 if not access_token: break
                 continue
             break
-        if not activities: break
+            
+        if not activities:
+            print("No more activities found.")
+            break
         
+        print(f"Found {len(activities)} activities on page {page}.")
         for act in activities:
-            exists = db.activity_exists(act['id'])
-            has_streams = db.activity_has_streams(act['id'])
+            act_id = act['id']
+            act_name = act['name']
+            exists = db.activity_exists(act_id)
+            has_streams = db.activity_has_streams(act_id)
+            
             if not exists or not has_streams:
+                if not exists:
+                    print(f"  New activity: {act_name} ({act_id})")
+                else:
+                    print(f"  Activity exists but missing streams: {act_name} ({act_id})")
+                
                 db.upsert_activity(act)
                 try:
-                    streams = manager.fetch_activity_streams(access_token, act['id'])
-                    if streams: db.insert_streams(act['id'], streams)
+                    streams = manager.fetch_activity_streams(access_token, act_id)
+                    if streams:
+                        db.insert_streams(act_id, streams)
+                        print(f"    Streams saved.")
                 except Exception as str_e:
+                    print(f"    Error fetching streams for {act_id}: {str_e}")
                     if "Unauthorized" in str(str_e):
+                        print("    Token expired during stream fetch, re-authenticating...")
                         access_token = manager.run_oauth_flow()
                         if access_token:
-                            streams = manager.fetch_activity_streams(access_token, act['id'])
-                            if streams: db.insert_streams(act['id'], streams)
+                            streams = manager.fetch_activity_streams(access_token, act_id)
+                            if streams: db.insert_streams(act_id, streams)
                 processed_count += 1
-        if len(activities) < 50: break
+            else:
+                # Debug: skip message
+                # print(f"  Skipping {act_name} (already indexed)")
+                pass
+                
+        if len(activities) < 50:
+            print("Reached last page of activities.")
+            break
         page += 1
     return processed_count
 
@@ -255,7 +299,11 @@ def run_analyze_effectiveness(db):
     acts = con.execute("SELECT da.activity_id, da.name, da.start_date_local, da.max_heartrate, da.average_speed, ath.sex FROM dim_activity da JOIN stream_heartrate sh ON da.activity_id = sh.activity_id JOIN dim_athlete ath ON da.athlete_id = ath.athlete_id GROUP BY 1,2,3,4,5,6").fetchall()
     
     processed = 0
-    for act_id, name, date, rep_max_hr, avg_speed, sex in acts:
+    total = len(acts)
+    for i, (act_id, name, date, rep_max_hr, avg_speed, sex) in enumerate(acts):
+        if i % 10 == 0:
+            print(f"  Processing {i}/{total}: {name}...")
+        
         hr_data = con.execute(f"SELECT value, time_offset FROM stream_heartrate WHERE activity_id = {act_id} ORDER BY time_offset").fetchall()
         if not hr_data: continue
         hr_vals, times = [h[0] for h in hr_data], [h[1] for h in hr_data]
@@ -265,11 +313,11 @@ def run_analyze_effectiveness(db):
         is_male = (sex == 'M')
         trimp_b = 0
         prev_t = times[0]
-        for i in range(1, len(hr_vals)):
-            dt = (times[i] - prev_t) / 60.0
+        for idx in range(1, len(hr_vals)):
+            dt = (times[idx] - prev_t) / 60.0
             if dt > 5: dt = 0
-            trimp_b += calculate_trimp_banister(dt * 60, hr_vals[i], user_max_hr, 60, is_male)
-            prev_t = times[i]
+            trimp_b += calculate_trimp_banister(dt * 60, hr_vals[idx], user_max_hr, 60, is_male)
+            prev_t = times[idx]
             
         trimp_e = calculate_trimp_edwards(hr_vals, user_max_hr)
         zones = calculate_time_in_zones(hr_vals, user_max_hr)
@@ -310,9 +358,9 @@ def main():
         return
         
     db = StravaDB()
-    print("Ingesting Strava data...", end='', flush=True)
-    count = ingest_data(manager, db, access_token)
-    print(f" Done ({count} new activities).")
+    print("Ingesting Strava data (past 42 days)...")
+    count = ingest_data(manager, db, access_token, lookback_days=42)
+    print(f"Ingestion complete ({count} new activities).")
     
     print("Analyzing effectiveness...", end='', flush=True)
     eff_count = run_analyze_effectiveness(db)
