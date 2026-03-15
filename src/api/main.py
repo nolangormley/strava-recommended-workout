@@ -1,5 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from typing import Optional
 import duckdb
 import pandas as pd
 import numpy as np
@@ -25,26 +29,201 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database Path
-# Docker: /app/data/strava_warehouse.duckdb
-# Local: ../data/strava_warehouse.duckdb
-# We assume this script is running from api/ directory or similar depth
-# os.path.dirname(__file__) -> .../api
-# os.path.dirname(...) -> .../root
+# Setup Templates and Static Files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Fallback in case they don't exist yet:
+os.makedirs(os.path.join(BASE_DIR, "static"), exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "templates"), exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
 DB_PATH = os.getenv('DB_PATH', os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'strava_warehouse.duckdb'))
 
 def get_db_connection():
     try:
-        # read_only=True is safer for API queries
-        return duckdb.connect(DB_PATH, read_only=True)
+        # read_only=False allows API to perform CRUD operations.
+        # Connections must be closed quickly to prevent holding the writer lock.
+        return duckdb.connect(DB_PATH, read_only=False)
     except Exception as e:
-        # If DB doesn't exist yet
         raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
+
+# ==========================================
+# FRONTEND ROUTES
+# ==========================================
+
+@app.get("/")
+def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/workout_streams/{activity_id}")
+def view_workout_streams(request: Request, activity_id: int):
+    return templates.TemplateResponse("streams.html", {"request": request, "activity_id": activity_id})
+
+# ==========================================
+# CRUD FOR ACTIVITIES (Read, Delete)
+# ==========================================
+
+@app.get("/api/activities")
+def get_activities():
+    con = get_db_connection()
+    try:
+        activities = con.execute("SELECT * FROM dim_activity ORDER BY start_date DESC").fetchall()
+        columns = [desc[0] for desc in con.description]
+        return [dict(zip(columns, row)) for row in activities]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+@app.get("/api/activities/{activity_id}")
+def get_activity(activity_id: int):
+    con = get_db_connection()
+    try:
+        activity = con.execute("SELECT * FROM dim_activity WHERE activity_id = ?", [activity_id]).fetchone()
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        columns = [desc[0] for desc in con.description]
+        return dict(zip(columns, activity))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+@app.get("/api/activities/{activity_id}/streams")
+def get_activity_streams(activity_id: int):
+    con = get_db_connection()
+    try:
+        # Join streams
+        query = """
+        SELECT 
+            t.time_offset,
+            v.value as velocity,
+            h.value as heartrate,
+            a.value as altitude,
+            c.value as cadence,
+            w.value as watts
+        FROM (
+            SELECT DISTINCT time_offset FROM stream_velocity WHERE activity_id = ?
+            UNION SELECT DISTINCT time_offset FROM stream_heartrate WHERE activity_id = ?
+        ) t
+        LEFT JOIN stream_velocity v ON v.activity_id = ? AND v.time_offset = t.time_offset
+        LEFT JOIN stream_heartrate h ON h.activity_id = ? AND h.time_offset = t.time_offset
+        LEFT JOIN stream_altitude a ON a.activity_id = ? AND a.time_offset = t.time_offset
+        LEFT JOIN stream_cadence c ON c.activity_id = ? AND c.time_offset = t.time_offset
+        LEFT JOIN stream_watts w ON w.activity_id = ? AND w.time_offset = t.time_offset
+        ORDER BY t.time_offset ASC
+        """
+        params = [activity_id] * 7
+        df = con.execute(query, params).fetchdf()
+        
+        # Replace NaNs with None so JSON serialization works
+        df = df.replace({np.nan: None})
+        
+        return df.to_dict(orient="records")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+@app.delete("/api/activities/{activity_id}")
+def delete_activity(activity_id: int):
+    con = get_db_connection()
+    try:
+        # Delete from all tables sequentially.
+        tables = [
+            "stream_altitude", "stream_cadence", "stream_heartrate", "stream_moving",
+            "stream_temperature", "stream_velocity", "stream_watts", "activity_effectiveness",
+            "dim_activity"
+        ]
+        for table in tables:
+            try:
+                con.execute(f"DELETE FROM {table} WHERE activity_id = ?", [activity_id])
+            except Exception as e:
+                print(f"Failed deleting from {table}: {e}")
+        return {"message": "Activity deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+# ==========================================
+# CRUD FOR WORKOUTS (Create, Read, Update, Delete)
+# ==========================================
+class WorkoutCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[str] = None
+    url: Optional[str] = None
+    source: Optional[str] = "Manual"
+
+@app.get("/api/workouts")
+def get_workouts():
+    con = get_db_connection()
+    try:
+        workouts = con.execute("SELECT * FROM dim_workouts ORDER BY workout_id DESC").fetchall()
+        columns = [desc[0] for desc in con.description]
+        return [dict(zip(columns, row)) for row in workouts]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+@app.post("/api/workouts")
+def create_workout(workout: WorkoutCreate):
+    con = get_db_connection()
+    try:
+        # Auto-incrementing workout_id via MAX + 1
+        max_id_row = con.execute("SELECT MAX(workout_id) FROM dim_workouts").fetchone()
+        next_id = (max_id_row[0] or 0) + 1 if max_id_row and max_id_row[0] is not None else 1
+        
+        con.execute(
+            "INSERT INTO dim_workouts (workout_id, name, description, category, tags, url, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [next_id, workout.name, workout.description, workout.category, workout.tags, workout.url, workout.source]
+        )
+        return {"message": "Workout created successfully", "workout_id": next_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+@app.put("/api/workouts/{workout_id}")
+def update_workout(workout_id: int, workout: WorkoutCreate):
+    con = get_db_connection()
+    try:
+        con.execute(
+            "UPDATE dim_workouts SET name=?, description=?, category=?, tags=?, url=?, source=? WHERE workout_id=?",
+            [workout.name, workout.description, workout.category, workout.tags, workout.url, workout.source, workout_id]
+        )
+        return {"message": "Workout updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+@app.delete("/api/workouts/{workout_id}")
+def delete_workout(workout_id: int):
+    con = get_db_connection()
+    try:
+        con.execute("DELETE FROM dim_workouts WHERE workout_id=?", [workout_id])
+        return {"message": "Workout deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
+
+
+# ==========================================
+# ORIGINAL ENDPOINTS & LOGIC (Refactored DB close)
+# ==========================================
 
 @app.get("/users/")
 def get_users():
+    con = get_db_connection()
     try:
-        con = get_db_connection()
         # Check if table exists
         try:
             users = con.execute("SELECT * FROM dim_athlete").fetchall()
@@ -58,110 +237,105 @@ def get_users():
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 def calculate_training_status_logic(user_id: int):
     con = get_db_connection()
-    
-    # 1. Get Daily TRIMP Sums for this user
     try:
-        df = con.execute("""
-            SELECT 
-                da.start_date_local::DATE as activity_date,
-                SUM(ae.trimp_banister) as daily_load,
-                AVG(ae.efficiency_factor) as daily_ef,
-                AVG(ae.aerobic_decoupling) as daily_decoup
-            FROM activity_effectiveness ae
-            JOIN dim_activity da ON ae.activity_id = da.activity_id
-            WHERE da.athlete_id = ?
-            GROUP BY 1
-            ORDER BY 1
-        """, [user_id]).fetchdf()
-    except Exception as e:
-        # Table might not exist
-        print(f"Error querying effectiveness: {e}")
-        return None
-    
-    if df.empty:
-        return None
-
-    # 2. Reindex
-    start_date = df['activity_date'].min()
-    end_date = pd.Timestamp(datetime.now().date())
-    
-    # Handle if start date is future (unlikely)
-    if start_date > end_date:
-        start_date = end_date
-
-    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-    daily_data = pd.DataFrame({'date': date_range.date})
-    daily_data['activity_date'] = pd.to_datetime(daily_data['date'])
-    df['activity_date'] = pd.to_datetime(df['activity_date'])
-    
-    merged = pd.merge(daily_data, df, on='activity_date', how='left')
-    merged['daily_load'] = merged['daily_load'].fillna(0)
-    
-    # Treat 0s as NaNs for EF and decoup so they don't skew the average or display as 0
-    merged['daily_ef'] = merged['daily_ef'].replace(0, np.nan)
-    merged['daily_decoup'] = merged['daily_decoup'].replace(0, np.nan)
-    
-    # 3. Calculate CTL, ATL, TSB
-    loads = merged['daily_load'].values
-    ctl, atl = calculate_ctl_atl(loads)
+        # 1. Get Daily TRIMP Sums for this user
+        try:
+            df = con.execute("""
+                SELECT 
+                    da.start_date_local::DATE as activity_date,
+                    SUM(ae.trimp_banister) as daily_load,
+                    AVG(ae.efficiency_factor) as daily_ef,
+                    AVG(ae.aerobic_decoupling) as daily_decoup
+                FROM activity_effectiveness ae
+                JOIN dim_activity da ON ae.activity_id = da.activity_id
+                WHERE da.athlete_id = ?
+                GROUP BY 1
+                ORDER BY 1
+            """, [user_id]).fetchdf()
+        except Exception as e:
+            print(f"Error querying effectiveness: {e}")
+            return None
         
-    merged['CTL'] = ctl
-    merged['ATL'] = atl
-    merged['TSB'] = calculate_tsb(merged['CTL'], merged['ATL'])
-    
-    # Calculate Rolling Averages for Insights (7-day)
-    merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
-    merged['Decoup_7d'] = merged['daily_decoup'].rolling(window=7, min_periods=1).mean()
-    
-    # Get last known actual values
-    merged['latest_ef'] = merged['daily_ef'].ffill()
-    merged['latest_decoup'] = merged['daily_decoup'].ffill()
-    
-    today_stats = merged.iloc[-1]
-    tsb = today_stats['TSB']
+        if df.empty:
+            return None
 
-    # Map TSB to Category
-    target_category = get_target_category(tsb)
-    
-    # Get VO2 Max estimate
-    vo2max_data = calculate_vo2max(user_id)
-    latest_vo2_max = vo2max_data.get('latest_vo2_max') if vo2max_data else None
+        # 2. Reindex
+        start_date = df['activity_date'].min()
+        end_date = pd.Timestamp(datetime.now().date())
+        
+        if start_date > end_date:
+            start_date = end_date
 
-    # Get Last 7 days history
-    history_df = merged.tail(7)
-    history_list = []
-    for _, row in history_df.iterrows():
-        history_list.append({
-            "date": str(row['date']),
-            "fitness": clean_val(row['CTL']),
-            "fatigue": clean_val(row['ATL']),
-            "form": clean_val(row['TSB']),
-            "daily_ef": clean_val(row['daily_ef'], 2),
-            "daily_decoup": clean_val(row['daily_decoup'], 1)
-        })
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+        daily_data = pd.DataFrame({'date': date_range.date})
+        daily_data['activity_date'] = pd.to_datetime(daily_data['date'])
+        df['activity_date'] = pd.to_datetime(df['activity_date'])
+        
+        merged = pd.merge(daily_data, df, on='activity_date', how='left')
+        merged['daily_load'] = merged['daily_load'].fillna(0)
+        
+        # Treat 0s as NaNs
+        merged['daily_ef'] = merged['daily_ef'].replace(0, np.nan)
+        merged['daily_decoup'] = merged['daily_decoup'].replace(0, np.nan)
+        
+        loads = merged['daily_load'].values
+        ctl, atl = calculate_ctl_atl(loads)
+            
+        merged['CTL'] = ctl
+        merged['ATL'] = atl
+        merged['TSB'] = calculate_tsb(merged['CTL'], merged['ATL'])
+        
+        merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
+        merged['Decoup_7d'] = merged['daily_decoup'].rolling(window=7, min_periods=1).mean()
+        
+        merged['latest_ef'] = merged['daily_ef'].ffill()
+        merged['latest_decoup'] = merged['daily_decoup'].ffill()
+        
+        today_stats = merged.iloc[-1]
+        tsb = today_stats['TSB']
 
-    return {
-        "date": str(today_stats['date']),
-        "fitness_ctl": clean_val(today_stats['CTL']),
-        "fatigue_atl": clean_val(today_stats['ATL']),
-        "form_tsb":    clean_val(today_stats['TSB']),
-        "target_category": target_category,
-        "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
-        "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
-        "latest_daily_ef": clean_val(today_stats.get('latest_ef'), 2),
-        "latest_daily_decoup": clean_val(today_stats.get('latest_decoup'), 1),
-        "latest_vo2_max": latest_vo2_max,
-        "history": history_list
-    }
+        target_category = get_target_category(tsb)
+        
+        vo2max_data = calculate_vo2max(user_id)
+        latest_vo2_max = vo2max_data.get('latest_vo2_max') if vo2max_data else None
+
+        history_df = merged.tail(7)
+        history_list = []
+        for _, row in history_df.iterrows():
+            history_list.append({
+                "date": str(row['date']),
+                "fitness": clean_val(row['CTL']),
+                "fatigue": clean_val(row['ATL']),
+                "form": clean_val(row['TSB']),
+                "daily_ef": clean_val(row['daily_ef'], 2),
+                "daily_decoup": clean_val(row['daily_decoup'], 1)
+            })
+
+        return {
+            "date": str(today_stats['date']),
+            "fitness_ctl": clean_val(today_stats['CTL']),
+            "fatigue_atl": clean_val(today_stats['ATL']),
+            "form_tsb":    clean_val(today_stats['TSB']),
+            "target_category": target_category,
+            "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
+            "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
+            "latest_daily_ef": clean_val(today_stats.get('latest_ef'), 2),
+            "latest_daily_decoup": clean_val(today_stats.get('latest_decoup'), 1),
+            "latest_vo2_max": latest_vo2_max,
+            "history": history_list
+        }
+    finally:
+        con.close()
 
 def get_ai_insight(stats, context="status", workout=None):
     try:
         history_str = "\n".join([f"  - {h['date']}: Form (TSB): {h['form']}, Load (ATL): {h['fatigue']}" for h in stats.get('history', [])])
 
-        # Construct Prompt
         if context == "status":
             prompt = (
                 f"Analyze the athlete's current training status and give a 2-3 sentence recommendation on what they should focus on.\n\n"
@@ -218,20 +392,15 @@ def get_ai_insight(stats, context="status", workout=None):
                     print(f"Groq error response body: {e.response.text}")
                 raise
         else:
-            # Call LM Studio local API
             url = "http://localhost:1234/api/v1/chat"
-                
             payload = {
                 "model": "mistralai/ministral-3-3b",
                 "system_prompt": system_prompt,
                 "input": prompt
             }
-            
             headers = {"Content-Type": "application/json"}
             response = requests.post(url, json=payload, headers=headers)
             response.raise_for_status()
-            
-            # Assuming the response format matches the custom local LM studio formats
             data = response.json()
             if "choices" in data and len(data["choices"]) > 0 and "message" in data["choices"][0]:
                 return data["choices"][0]["message"]["content"]
@@ -254,9 +423,7 @@ def get_status(user_id: int):
     if not status:
         raise HTTPException(status_code=404, detail="No training data found for user (Did you run analyze_effectiveness.py?)")
     
-    # Add AI Insight
     status['ai_insight'] = get_ai_insight(status, context="status")
-    
     return status
 
 @app.get("/recommend/{user_id}")
@@ -272,110 +439,108 @@ def get_recommendation(user_id: int):
         
     con = get_db_connection()
     try:
-        workouts = con.execute("SELECT name, description, url, category FROM dim_workouts WHERE category = ?", [target_category]).fetchall()
-    except Exception as e:
-        # Table might not exist
-        return {"error": "dim_workouts table not found. Run ingest_workouts.py first."}
+        try:
+            workouts = con.execute("SELECT name, description, url, category FROM dim_workouts WHERE category = ?", [target_category]).fetchall()
+        except Exception as e:
+            return {"error": "dim_workouts table not found. Run ingest_workouts.py first."}
 
-    # Fallback logic
-    if not workouts:
-         fallback_map = {
-             "Anaerobic": "VO2Max",
-             "VO2Max": "Threshold", # Or Aerobic
-             "Threshold": "Aerobic",
-             "Aerobic": "Recovery",
-             "Recovery": "Aerobic" 
-         }
-         # Try fallback
-         orig_target = target_category
-         target_category = fallback_map.get(target_category, "Aerobic")
-         workouts = con.execute("SELECT name, description, url, category FROM dim_workouts WHERE category = ?", [target_category]).fetchall()
-         
-    if not workouts:
-         # Final fallback to anything
-         workouts = con.execute("SELECT name, description, url, category FROM dim_workouts LIMIT 5").fetchall()
-         if not workouts:
-            return {"message": "No workouts found in library at all."}
+        if not workouts:
+             fallback_map = {
+                 "Anaerobic": "VO2Max",
+                 "VO2Max": "Threshold", 
+                 "Threshold": "Aerobic",
+                 "Aerobic": "Recovery",
+                 "Recovery": "Aerobic" 
+             }
+             orig_target = target_category
+             target_category = fallback_map.get(target_category, "Aerobic")
+             workouts = con.execute("SELECT name, description, url, category FROM dim_workouts WHERE category = ?", [target_category]).fetchall()
+             
+        if not workouts:
+             workouts = con.execute("SELECT name, description, url, category FROM dim_workouts LIMIT 5").fetchall()
+             if not workouts:
+                return {"message": "No workouts found in library at all."}
 
-    w = random.choice(workouts)
-    
-    w_dict = {
-            "name": w[0],
-            "description": w[1],
-            "url": w[2],
-            "category": w[3]
+        w = random.choice(workouts)
+        
+        w_dict = {
+                "name": w[0],
+                "description": w[1],
+                "url": w[2],
+                "category": w[3]
+            }
+        
+        ai_reasoning = get_ai_insight(status, context="workout", workout=w_dict)
+        
+        return {
+            "user_id": user_id,
+            "current_tsb": tsb,
+            "recommended_category": target_category,
+            "ai_reasoning": ai_reasoning,
+            "workout": w_dict
         }
-    
-    # Add AI Reasoning
-    ai_reasoning = get_ai_insight(status, context="workout", workout=w_dict)
-    
-    return {
-        "user_id": user_id,
-        "current_tsb": tsb,
-        "recommended_category": target_category,
-        "ai_reasoning": ai_reasoning,
-        "workout": w_dict
-    }
+    finally:
+        con.close()
 
 def calculate_vo2max(user_id: int):
     con = get_db_connection()
     try:
-        max_hr_query = con.execute("SELECT MAX(max_heartrate) FROM dim_activity WHERE athlete_id=?", [user_id]).fetchone()
-        hr_max = max_hr_query[0] if max_hr_query and max_hr_query[0] and max_hr_query[0] > 100 else 190
-    except:
-        hr_max = 190
+        try:
+            max_hr_query = con.execute("SELECT MAX(max_heartrate) FROM dim_activity WHERE athlete_id=?", [user_id]).fetchone()
+            hr_max = max_hr_query[0] if max_hr_query and max_hr_query[0] and max_hr_query[0] > 100 else 190
+        except:
+            hr_max = 190
 
-    hr_rest = 60
-    
-    try:
-        query = """
-        SELECT 
-            a.activity_id,
-            a.start_date_local::DATE as activity_date,
-            v.value as speed,
-            h.value as hr
-        FROM dim_activity a
-        JOIN stream_velocity v ON a.activity_id = v.activity_id
-        JOIN stream_heartrate h ON a.activity_id = h.activity_id AND v.time_offset = h.time_offset
-        WHERE a.athlete_id = ? AND a.type = 'Run'
-          AND v.value > 1.5
-          AND h.value > 100
-        """
-        df = con.execute(query, [user_id]).fetchdf()
-    except Exception as e:
-        print(f"Error querying streams: {e}")
-        return None
+        hr_rest = 60
         
-    if df.empty:
-        return None
+        try:
+            query = """
+            SELECT 
+                a.activity_id,
+                a.start_date_local::DATE as activity_date,
+                v.value as speed,
+                h.value as hr
+            FROM dim_activity a
+            JOIN stream_velocity v ON a.activity_id = v.activity_id
+            JOIN stream_heartrate h ON a.activity_id = h.activity_id AND v.time_offset = h.time_offset
+            WHERE a.athlete_id = ? AND a.type = 'Run'
+              AND v.value > 1.5
+              AND h.value > 100
+            """
+            df = con.execute(query, [user_id]).fetchdf()
+        except Exception as e:
+            print(f"Error querying streams: {e}")
+            return None
+            
+        if df.empty:
+            return None
+            
+        df = calculate_vo2max_from_df(df, hr_max, hr_rest)
+        if df is None or df.empty:
+            return None
         
-    df = calculate_vo2max_from_df(df, hr_max, hr_rest)
-    if df is None or df.empty:
-        return None
-    
-    # Calculate median per activity date
-    results = df.groupby('activity_date')['vo2_max_est'].median().reset_index()
-    results = results.sort_values('activity_date')
-    
-    # Roll 7 day average of the estimations
-    results['vo2_max_rolling_7d'] = results['vo2_max_est'].rolling(window=7, min_periods=1).mean()
+        results = df.groupby('activity_date')['vo2_max_est'].median().reset_index()
+        results = results.sort_values('activity_date')
+        
+        results['vo2_max_rolling_7d'] = results['vo2_max_est'].rolling(window=7, min_periods=1).mean()
 
-    latest = results.iloc[-1]
-    
-    history_list = []
-    # Return last 14 days
-    for _, row in results.tail(14).iterrows():
-        history_list.append({
-            "date": str(row['activity_date']),
-            "vo2_max_estimate": clean_val(row['vo2_max_est'], 2),
-            "vo2_max_rolling_7d": clean_val(row['vo2_max_rolling_7d'], 2)
-        })
+        latest = results.iloc[-1]
+        
+        history_list = []
+        for _, row in results.tail(14).iterrows():
+            history_list.append({
+                "date": str(row['activity_date']),
+                "vo2_max_estimate": clean_val(row['vo2_max_est'], 2),
+                "vo2_max_rolling_7d": clean_val(row['vo2_max_rolling_7d'], 2)
+            })
 
-    return {
-        "user_id": user_id,
-        "latest_vo2_max": clean_val(latest['vo2_max_rolling_7d'], 2),
-        "history": history_list
-    }
+        return {
+            "user_id": user_id,
+            "latest_vo2_max": clean_val(latest['vo2_max_rolling_7d'], 2),
+            "history": history_list
+        }
+    finally:
+        con.close()
 
 @app.get("/vo2max/{user_id}")
 def get_vo2max(user_id: int):
