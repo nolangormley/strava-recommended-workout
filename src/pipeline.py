@@ -129,9 +129,15 @@ class StravaDB:
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS dim_athlete (
                 athlete_id UBIGINT PRIMARY KEY, username VARCHAR, firstname VARCHAR, lastname VARCHAR,
-                city VARCHAR, state VARCHAR, country VARCHAR, sex VARCHAR, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                city VARCHAR, state VARCHAR, country VARCHAR, sex VARCHAR, weight DOUBLE, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        try:
+            self.con.execute("ALTER TABLE dim_athlete ADD COLUMN weight DOUBLE;")
+        except duckdb.CatalogException:
+            pass
+        except duckdb.BinderException:
+            pass
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS dim_activity (
                 activity_id UBIGINT PRIMARY KEY, athlete_id UBIGINT, name VARCHAR, type VARCHAR,
@@ -155,9 +161,9 @@ class StravaDB:
 
     def upsert_athlete(self, a):
         self.con.execute("""
-            INSERT INTO dim_athlete (athlete_id, username, firstname, lastname, city, state, country, sex) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (athlete_id) DO UPDATE SET username=EXCLUDED.username, firstname=EXCLUDED.firstname, lastname=EXCLUDED.lastname, city=EXCLUDED.city, state=EXCLUDED.state, country=EXCLUDED.country, sex=EXCLUDED.sex, updated_at=now();
-        """, [a.get('id'), a.get('username'), a.get('firstname'), a.get('lastname'), a.get('city'), a.get('state'), a.get('country'), a.get('sex')])
+            INSERT INTO dim_athlete (athlete_id, username, firstname, lastname, city, state, country, sex, weight) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (athlete_id) DO UPDATE SET username=EXCLUDED.username, firstname=EXCLUDED.firstname, lastname=EXCLUDED.lastname, city=EXCLUDED.city, state=EXCLUDED.state, country=EXCLUDED.country, sex=EXCLUDED.sex, weight=EXCLUDED.weight, updated_at=now();
+        """, [a.get('id'), a.get('username'), a.get('firstname'), a.get('lastname'), a.get('city'), a.get('state'), a.get('country'), a.get('sex'), a.get('weight')])
 
     def upsert_activity(self, a):
         self.con.execute("""
@@ -196,6 +202,8 @@ def ingest_data(manager, db, access_token, lookback_days=42):
         print(f"Athlete: {athlete.get('firstname')} {athlete.get('lastname')}")
     except Exception as e:
         print(f"Warning: Could not fetch athlete profile: {e}")
+
+    after_timestamp = int(time.time() - (lookback_days * 24 * 60 * 60))
 
     page = 1
     processed_count = 0
@@ -288,11 +296,11 @@ def run_analyze_effectiveness(db):
     con.execute("DROP TABLE IF EXISTS activity_effectiveness")
     con.execute("CREATE TABLE IF NOT EXISTS activity_effectiveness (activity_id UBIGINT PRIMARY KEY, trimp_banister DOUBLE, trimp_edwards DOUBLE, efficiency_factor DOUBLE, intensity_factor DOUBLE, aerobic_decoupling DOUBLE, zone_1_sec INTEGER, zone_2_sec INTEGER, zone_3_sec INTEGER, zone_4_sec INTEGER, zone_5_sec INTEGER, effectiveness_score DOUBLE, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (activity_id) REFERENCES dim_activity(activity_id));")
     
-    acts = con.execute("SELECT da.activity_id, da.name, da.start_date_local, da.max_heartrate, da.average_speed FROM dim_activity da JOIN stream_heartrate sh ON da.activity_id = sh.activity_id GROUP BY 1,2,3,4,5").fetchall()
+    acts = con.execute("SELECT da.activity_id, da.name, da.start_date_local, da.max_heartrate, da.average_speed, ath.sex FROM dim_activity da JOIN stream_heartrate sh ON da.activity_id = sh.activity_id JOIN dim_athlete ath ON da.athlete_id = ath.athlete_id GROUP BY 1,2,3,4,5,6").fetchall()
     
     processed = 0
     total = len(acts)
-    for i, (act_id, name, date, rep_max_hr, avg_speed) in enumerate(acts):
+    for i, (act_id, name, date, rep_max_hr, avg_speed, sex) in enumerate(acts):
         if i % 10 == 0:
             print(f"  Processing {i}/{total}: {name}...")
         
@@ -302,12 +310,13 @@ def run_analyze_effectiveness(db):
         user_max_hr = rep_max_hr if (rep_max_hr and rep_max_hr > 150) else 192
         avg_hr = sum(hr_vals) / len(hr_vals)
         
+        is_male = (sex == 'M')
         trimp_b = 0
         prev_t = times[0]
         for idx in range(1, len(hr_vals)):
             dt = (times[idx] - prev_t) / 60.0
             if dt > 5: dt = 0
-            trimp_b += calculate_trimp_banister(dt * 60, hr_vals[idx], user_max_hr, 60, True)
+            trimp_b += calculate_trimp_banister(dt * 60, hr_vals[idx], user_max_hr, 60, is_male)
             prev_t = times[idx]
             
         trimp_e = calculate_trimp_edwards(hr_vals, user_max_hr)
