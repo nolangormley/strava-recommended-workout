@@ -271,52 +271,52 @@ def calculate_training_status_logic(user_id: int):
         if start_date > end_date:
             start_date = end_date
 
-    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-    daily_data = pd.DataFrame({'date': date_range.date})
-    daily_data['activity_date'] = pd.to_datetime(daily_data['date'])
-    df['activity_date'] = pd.to_datetime(df['activity_date'])
-    
-    merged = pd.merge(daily_data, df, on='activity_date', how='left')
-    merged['daily_load'] = merged['daily_load'].fillna(0)
-    
-    # Treat 0s as NaNs for EF and decoup so they don't skew the average or display as 0
-    merged['daily_ef'] = merged['daily_ef'].replace(0, np.nan)
-    merged['daily_decoup'] = merged['daily_decoup'].replace(0, np.nan)
-    
-    # 3. Calculate CTL, ATL, TSB
-    loads = merged['daily_load'].values
-    ctl, atl = calculate_ctl_atl(loads)
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+        daily_data = pd.DataFrame({'date': date_range.date})
+        daily_data['activity_date'] = pd.to_datetime(daily_data['date'])
+        df['activity_date'] = pd.to_datetime(df['activity_date'])
         
-    merged['CTL'] = ctl
-    merged['ATL'] = atl
-    merged['TSB'] = calculate_tsb(merged['CTL'], merged['ATL'])
-    merged['ACWR'] = calculate_acwr(merged['CTL'], merged['ATL'])
-    
-    # Calculate Rolling Averages for Insights (7-day)
-    merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
-    merged['Decoup_7d'] = merged['daily_decoup'].rolling(window=7, min_periods=1).mean()
-    
-    # Get last known actual values
-    merged['latest_ef'] = merged['daily_ef'].ffill()
-    merged['latest_decoup'] = merged['daily_decoup'].ffill()
-    
-    today_stats = merged.iloc[-1]
-    tsb = today_stats['TSB']
+        merged = pd.merge(daily_data, df, on='activity_date', how='left')
+        merged['daily_load'] = merged['daily_load'].fillna(0)
+        
+        # Treat 0s as NaNs for EF and decoup so they don't skew the average or display as 0
+        merged['daily_ef'] = merged['daily_ef'].replace(0, np.nan)
+        merged['daily_decoup'] = merged['daily_decoup'].replace(0, np.nan)
+        
+        # 3. Calculate CTL, ATL, TSB
+        loads = merged['daily_load'].values
+        ctl, atl = calculate_ctl_atl(loads)
+            
+        merged['CTL'] = ctl
+        merged['ATL'] = atl
+        merged['TSB'] = calculate_tsb(merged['CTL'], merged['ATL'])
+        merged['ACWR'] = calculate_acwr(merged['CTL'], merged['ATL'])
+        
+        # Calculate Rolling Averages for Insights (7-day)
+        merged['EF_7d'] = merged['daily_ef'].rolling(window=7, min_periods=1).mean()
+        merged['Decoup_7d'] = merged['daily_decoup'].rolling(window=7, min_periods=1).mean()
+        
+        # Get last known actual values
+        merged['latest_ef'] = merged['daily_ef'].ffill()
+        merged['latest_decoup'] = merged['daily_decoup'].ffill()
+        
+        today_stats = merged.iloc[-1]
+        tsb = today_stats['TSB']
 
-    target_category = get_target_category(tsb)
-    
-    vo2max_data = calculate_vo2max(user_id)
-    latest_vo2_max = vo2max_data.get('latest_vo2_max') if vo2max_data else None
-    
-    # Get Athlete Info
-    try:
-        athlete_data = con.execute("SELECT weight, sex FROM dim_athlete WHERE athlete_id = ?", [user_id]).fetchone()
-        weight_kg = athlete_data[0] if athlete_data else None
-        weight_lbs = round(weight_kg * 2.20462) if weight_kg else None
-        sex = athlete_data[1] if athlete_data else None
-    except:
-        weight_lbs = None
-        sex = None
+        target_category = get_target_category(tsb)
+        
+        vo2max_data = calculate_vo2max(user_id)
+        latest_vo2_max = vo2max_data.get('latest_vo2_max') if vo2max_data else None
+        
+        # Get Athlete Info
+        try:
+            athlete_data = con.execute("SELECT weight, sex FROM dim_athlete WHERE athlete_id = ?", [user_id]).fetchone()
+            weight_kg = athlete_data[0] if athlete_data else None
+            weight_lbs = round(weight_kg * 2.20462) if weight_kg else None
+            sex = athlete_data[1] if athlete_data else None
+        except:
+            weight_lbs = None
+            sex = None
 
         history_df = merged.tail(7)
         history_list = []
@@ -330,22 +330,22 @@ def calculate_training_status_logic(user_id: int):
                 "daily_decoup": clean_val(row['daily_decoup'], 1)
             })
 
-    return {
-        "date": str(today_stats['date']),
-        "fitness_ctl": clean_val(today_stats['CTL']),
-        "fatigue_atl": clean_val(today_stats['ATL']),
-        "form_tsb":    clean_val(today_stats['TSB']),
-        "acwr":        clean_val(today_stats['ACWR'], 2),
-        "target_category": target_category,
-        "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
-        "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
-        "latest_daily_ef": clean_val(today_stats.get('latest_ef'), 2),
-        "latest_daily_decoup": clean_val(today_stats.get('latest_decoup'), 1),
-        "latest_vo2_max": latest_vo2_max,
-        "history": history_list
-    }
+        return {
+            "date": str(today_stats['date']),
+            "fitness_ctl": clean_val(today_stats['CTL']),
+            "fatigue_atl": clean_val(today_stats['ATL']),
+            "form_tsb":    clean_val(today_stats['TSB']),
+            "acwr":        clean_val(today_stats['ACWR'], 2),
+            "target_category": target_category,
+            "efficiency_factor_7d": clean_val(today_stats.get('EF_7d'), 2),
+            "aerobic_decoupling_7d": clean_val(today_stats.get('Decoup_7d'), 1),
+            "latest_daily_ef": clean_val(today_stats.get('latest_ef'), 2),
+            "latest_daily_decoup": clean_val(today_stats.get('latest_decoup'), 1),
+            "latest_vo2_max": latest_vo2_max,
+            "history": history_list
+        }
     finally:
-
+        con.close()
 
 def get_ai_insight(stats, context="status", workout=None):
     try:

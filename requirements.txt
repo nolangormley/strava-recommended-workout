@@ -8,3 +8,4 @@ numpy
 playwright
 beautifulsoup4
 openai
+jinja2
