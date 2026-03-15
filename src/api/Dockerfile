@@ -6,8 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy API Code
-COPY src/api/ /app/src/api/
+# Copy full src code (so src.api and src.metrics work)
+COPY src/ /app/src/
 
 # Set Python Path to include /app so "src.api.main" resolves
 ENV PYTHONPATH=/app

@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Strava Warehouse</title>
+    <meta name="description" content="Dashboard for your Strava Activities and Recommended Workouts">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <div class="logo-container">
+            <div class="logo-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                </svg>
+            </div>
+            <h2>Strava Warehouse</h2>
+        </div>
+        <div>
+            <span class="tag">Local DuckDB</span>
+        </div>
+    </header>
+
+    <main class="container">
+        <h1 class="main-title">Training Dashboard</h1>
+        <p class="subtitle">Manage your synced Strava activities and recommended Coros workouts.</p>
+
+        <div class="glass-panel">
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('activities')">Strava Activities</button>
+                <button class="tab-btn" onclick="switchTab('workouts')">Recommended Workouts</button>
+            </div>
+
+            <!-- TAB 1: Activities -->
+            <div id="activities-tab" class="tab-content">
+                <div class="action-header">
+                    <h3>Recent Synced Runs</h3>
+                    <button class="btn" onclick="fetchActivities()">Refresh</button>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Name</th>
+                                <th>Distance</th>
+                                <th>Time</th>
+                                <th>Pace</th>
+                                <th>Avg HR</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="activities-tbody">
+                            <tr><td colspan="7">Loading activities...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- TAB 2: Workouts -->
+            <div id="workouts-tab" class="tab-content hidden">
+                <div class="action-header">
+                    <h3>Workout Library</h3>
+                    <button class="btn btn-primary" onclick="openWorkoutModal()">+ Add Custom Workout</button>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Category</th>
+                                <th>Description</th>
+                                <th>Source</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="workouts-tbody">
+                            <tr><td colspan="5">Loading workouts...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Workout Modal (Create/Edit) -->
+    <div class="modal-overlay" id="workout-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title">Add Custom Workout</h3>
+                <button class="close-btn" onclick="closeWorkoutModal()">&times;</button>
+            </div>
+            
+            <form id="workout-form">
+                <input type="hidden" id="workout-id">
+                
+                <div class="form-group">
+                    <label for="workout-name">Workout Name</label>
+                    <input type="text" id="workout-name" class="form-control" required placeholder="e.g. 8x400m Intervals">
+                </div>
+                
+                <div class="form-group">
+                    <label for="workout-category">Category</label>
+                    <select id="workout-category" class="form-control" required>
+                        <option value="Recovery">Recovery</option>
+                        <option value="Aerobic">Aerobic Base</option>
+                        <option value="Threshold">Threshold</option>
+                        <option value="VO2Max">VO2 Max</option>
+                        <option value="Anaerobic">Anaerobic Capacity</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="workout-tags">Tags (Comma separated)</label>
+                    <input type="text" id="workout-tags" class="form-control" placeholder="track, intervals, speed">
+                </div>
+                
+                <div class="form-group">
+                    <label for="workout-desc">Description</label>
+                    <textarea id="workout-desc" class="form-control" placeholder="Warm up 2 miles, 8x400 at 5k pace with 200m jog recovery, cool down 2 miles."></textarea>
+                </div>
+
+                <div class="form-actions">
+                    <button type="button" class="btn" onclick="closeWorkoutModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="save-workout-btn">Save Workout</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast">
+        <span id="toast-msg">Success!</span>
+    </div>
+
+    <script>
+        // Utilities
+        function showToast(msg, type='success') {
+            const toast = document.getElementById('toast');
+            const msgEl = document.getElementById('toast-msg');
+            toast.className = `toast show ${type}`;
+            msgEl.textContent = msg;
+            setTimeout(() => { toast.classList.remove('show'); }, 3000);
+        }
+
+        function formatDistance(meters) {
+            return (meters * 0.000621371).toFixed(2) + ' mi';
+        }
+
+        function formatPace(meters_per_sec) {
+            if (!meters_per_sec) return '--';
+            const mins_per_mile = 26.8224 / meters_per_sec; 
+            const m = Math.floor(mins_per_mile);
+            const s = Math.floor((mins_per_mile - m) * 60).toString().padStart(2, '0');
+            return `${m}:${s}/mi`;
+        }
+
+        function formatTime(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            if (h > 0) return `${h}h ${m}m`;
+            return `${m}m ${s}s`;
+        }
+        
+        function formatDate(dt_string) {
+            const d = new Date(dt_string);
+            return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        // Tabs Logic
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            
+            event.target.classList.add('active');
+            document.getElementById(`${tab}-tab`).classList.remove('hidden');
+
+            if (tab === 'activities' && document.getElementById('activities-tbody').children.length <= 1) {
+                fetchActivities();
+            } else if (tab === 'workouts' && document.getElementById('workouts-tbody').children.length <= 1) {
+                fetchWorkouts();
+            }
+        }
+
+        // ==========================================
+        // ACTIVITIES API
+        // ==========================================
+        async function fetchActivities() {
+            const tbody = document.getElementById('activities-tbody');
+            tbody.innerHTML = '<tr><td colspan="7"><div class="loader"></div> Loading...</td></tr>';
+            try {
+                const res = await fetch('/api/activities');
+                const data = await res.json();
+                
+                tbody.innerHTML = '';
+                if (data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7">No activities found.</td></tr>';
+                    return;
+                }
+
+                data.forEach(act => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td>${formatDate(act.start_date_local)}</td>
+                        <td><strong>${act.name}</strong></td>
+                        <td>${formatDistance(act.distance)}</td>
+                        <td>${formatTime(act.moving_time)}</td>
+                        <td>${formatPace(act.average_speed)}</td>
+                        <td>${act.average_heartrate ? Math.round(act.average_heartrate) + ' bpm' : '--'}</td>
+                        <td>
+                            <div class="btn-group">
+                                <a href="/workout_streams/${act.activity_id}" class="btn">View Flow</a>
+                                <button class="btn btn-danger" onclick="deleteActivity(${act.activity_id})">Delete</button>
+                            </div>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="7" style="color:var(--danger)">Failed to load: ${e}</td></tr>`;
+                showToast("Failed to load activities", 'error');
+            }
+        }
+
+        async function deleteActivity(id) {
+            if(!confirm("Are you sure you want to delete this activity and all its streams? This cannot be undone.")) return;
+            try {
+                const res = await fetch(`/api/activities/${id}`, { method: 'DELETE' });
+                if (res.ok) {
+                    showToast("Activity deleted");
+                    fetchActivities();
+                } else {
+                    const err = await res.json();
+                    showToast(err.detail || "Error deleting", 'error');
+                }
+            } catch (e) {
+                showToast("Connection error", 'error');
+            }
+        }
+
+        // ==========================================
+        // WORKOUTS API
+        // ==========================================
+        async function fetchWorkouts() {
+            const tbody = document.getElementById('workouts-tbody');
+            tbody.innerHTML = '<tr><td colspan="5"><div class="loader"></div> Loading...</td></tr>';
+            try {
+                const res = await fetch('/api/workouts');
+                const data = await res.json();
+                
+                tbody.innerHTML = '';
+                if (data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5">No workouts found.</td></tr>';
+                    return;
+                }
+
+                data.forEach(w => {
+                    const tr = document.createElement('tr');
+                    const desc = w.description ? (w.description.length > 60 ? w.description.substring(0, 60) + '...' : w.description) : '--';
+                    tr.innerHTML = `
+                        <td><strong>${w.name}</strong></td>
+                        <td><span class="tag">${w.category || 'Uncategorized'}</span></td>
+                        <td><small>${desc}</small></td>
+                        <td><small>${w.source || 'Manual'}</small></td>
+                        <td>
+                            <div class="btn-group">
+                                <button class="btn" onclick='editWorkout(${JSON.stringify(w).replace(/'/g, "&#39;")})'>Edit</button>
+                                <button class="btn btn-danger" onclick="deleteWorkout(${w.workout_id})">Delete</button>
+                            </div>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="5" style="color:var(--danger)">Failed to load: ${e}</td></tr>`;
+            }
+        }
+
+        function openWorkoutModal(workout = null) {
+            document.getElementById('workout-modal').classList.add('active');
+            if (workout) {
+                document.getElementById('modal-title').innerText = "Edit Workout";
+                document.getElementById('workout-id').value = workout.workout_id;
+                document.getElementById('workout-name').value = workout.name;
+                document.getElementById('workout-category').value = workout.category;
+                document.getElementById('workout-tags').value = workout.tags || '';
+                document.getElementById('workout-desc').value = workout.description || '';
+            } else {
+                document.getElementById('modal-title').innerText = "Add Custom Workout";
+                document.getElementById('workout-form').reset();
+                document.getElementById('workout-id').value = "";
+            }
+        }
+
+        function closeWorkoutModal() {
+            document.getElementById('workout-modal').classList.remove('active');
+        }
+
+        function editWorkout(workoutObj) {
+            openWorkoutModal(workoutObj);
+        }
+
+        async function deleteWorkout(id) {
+            if(!confirm("Delete this recommended workout?")) return;
+            try {
+                const res = await fetch(`/api/workouts/${id}`, { method: 'DELETE' });
+                if (res.ok) {
+                    showToast("Workout deleted");
+                    fetchWorkouts();
+                } else showToast("Error deleting", 'error');
+            } catch (e) { showToast("Error", 'error'); }
+        }
+
+        document.getElementById('workout-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const id = document.getElementById('workout-id').value;
+            const payload = {
+                name: document.getElementById('workout-name').value,
+                category: document.getElementById('workout-category').value,
+                tags: document.getElementById('workout-tags').value,
+                description: document.getElementById('workout-desc').value,
+                source: "Manual"
+            };
+
+            const btn = document.getElementById('save-workout-btn');
+            btn.innerHTML = '<div class="loader"></div>';
+            btn.disabled = true;
+
+            try {
+                let res;
+                if (id) {
+                    // Update
+                    res = await fetch(`/api/workouts/${id}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                } else {
+                    // Create
+                    res = await fetch(`/api/workouts`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                }
+
+                if (res.ok) {
+                    closeWorkoutModal();
+                    showToast(id ? "Workout updated!" : "Workout created!");
+                    fetchWorkouts();
+                } else {
+                    const err = await res.json();
+                    showToast(err.detail || "Failed to save", 'error');
+                }
+            } catch (error) {
+                showToast("Connection error", 'error');
+            } finally {
+                btn.innerHTML = 'Save Workout';
+                btn.disabled = false;
+            }
+        });
+
+        // Initialize Fetch
+        fetchActivities();
+
+    </script>
+</body>
+</html>

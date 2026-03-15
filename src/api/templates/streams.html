@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workout Streams - Strava Warehouse</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .header-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-lg);
+            padding: 1.5rem;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .chart-wrapper {
+            background: var(--bg-secondary);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-lg);
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            height: 400px;
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div class="logo-container">
+            <div class="logo-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                </svg>
+            </div>
+            <h2>Strava Warehouse</h2>
+        </div>
+        <div>
+            <a href="/" class="btn">Back to Dashboard</a>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="header-actions">
+            <div>
+                <h1 id="activity-name">Loading...</h1>
+                <p class="subtitle" id="activity-date">Fetching details...</p>
+            </div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="stat-dist">--</div>
+                <div class="stat-label">Distance</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-time">--</div>
+                <div class="stat-label">Moving Time</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-pace">--</div>
+                <div class="stat-label">Avg Pace</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-hr">--</div>
+                <div class="stat-label">Avg HR</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-elev">--</div>
+                <div class="stat-label">Elevation</div>
+            </div>
+        </div>
+
+        <div class="chart-wrapper">
+            <canvas id="hrChart"></canvas>
+        </div>
+
+        <div class="chart-wrapper">
+            <canvas id="paceChart"></canvas>
+        </div>
+
+        <div class="chart-wrapper">
+            <canvas id="elevationChart"></canvas>
+        </div>
+
+    </main>
+
+    <script>
+        const activityId = "{{ activity_id }}";
+
+        // Globals for Charts
+        Chart.defaults.color = '#8b949e';
+        Chart.defaults.font.family = 'Inter';
+
+        function formatDistance(meters) {
+            return (meters * 0.000621371).toFixed(2) + ' mi';
+        }
+
+        function formatPaceStr(meters_per_sec) {
+            if (!meters_per_sec || meters_per_sec === 0) return '--';
+            const mins_per_mile = 26.8224 / meters_per_sec;
+            const m = Math.floor(mins_per_mile);
+            const s = Math.floor((mins_per_mile - m) * 60).toString().padStart(2, '0');
+            return `${m}:${s}/mi`;
+        }
+
+        // Return decimal minutes per mile for charting (e.g. 8.5 for 8:30 min/mi)
+        function formatPaceDecimal(meters_per_sec) {
+            if (!meters_per_sec || meters_per_sec === 0) return null;
+            return 26.8224 / meters_per_sec;
+        }
+
+        function formatTimeMinSec(seconds) {
+            const m = Math.floor(seconds / 60);
+            const s = (seconds % 60).toString().padStart(2, '0');
+            return `${m}:${s}`;
+        }
+
+        function formatTimeDisplay(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            if (h > 0) return `${h}h ${m}m`;
+            return `${m}m ${s}s`;
+        }
+
+        async function init() {
+            try {
+                // Fetch Details
+                const res = await fetch(`/api/activities/${activityId}`);
+                if (!res.ok) throw new Error("Activity not found");
+                const act = await res.json();
+
+                document.getElementById('activity-name').textContent = act.name;
+                document.getElementById('activity-date').textContent = new Date(act.start_date_local).toLocaleString();
+
+                document.getElementById('stat-dist').textContent = formatDistance(act.distance);
+                document.getElementById('stat-time').textContent = formatTimeDisplay(act.moving_time);
+                document.getElementById('stat-pace').textContent = formatPaceStr(act.average_speed);
+                document.getElementById('stat-hr').textContent = act.average_heartrate ? Math.round(act.average_heartrate) : '--';
+                document.getElementById('stat-elev').textContent = act.total_elevation_gain ? Math.round(act.total_elevation_gain * 3.28084) + ' ft' : '--';
+
+                // Fetch Streams
+                const streamRes = await fetch(`/api/activities/${activityId}/streams`);
+                const streams = await streamRes.json();
+
+                if (streams.length > 0) {
+                    renderCharts(streams);
+                }
+
+            } catch (e) {
+                document.getElementById('activity-name').textContent = "Error Loading Activity";
+                document.getElementById('activity-date').textContent = e.toString();
+            }
+        }
+
+        function renderCharts(data) {
+            const labels = data.map(d => formatTimeMinSec(d.time_offset));
+            const hrData = data.map(d => d.heartrate);
+            const paceData = data.map(d => formatPaceDecimal(d.velocity));
+            const elevData = data.map(d => d.altitude ? d.altitude * 3.28084 : null);
+
+            // Heart Rate Chart
+            const ctxHr = document.getElementById('hrChart').getContext('2d');
+            const hrGradient = ctxHr.createLinearGradient(0, 0, 0, 400);
+            hrGradient.addColorStop(0, 'rgba(248, 81, 73, 0.5)'); // Reddish
+            hrGradient.addColorStop(1, 'rgba(248, 81, 73, 0.0)');
+
+            new Chart(ctxHr, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Heart Rate (bpm)',
+                        data: hrData,
+                        borderColor: '#f85149',
+                        backgroundColor: hrGradient,
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: getCommonOptions('Heart Rate', false)
+            });
+
+            // Pace Chart
+            const ctxPace = document.getElementById('paceChart').getContext('2d');
+            const paceGradient = ctxPace.createLinearGradient(0, 0, 0, 400);
+            paceGradient.addColorStop(0, 'rgba(88, 166, 255, 0.5)'); // Blueish
+            paceGradient.addColorStop(1, 'rgba(88, 166, 255, 0.0)');
+
+            new Chart(ctxPace, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Pace (min/mi)',
+                        data: paceData,
+                        borderColor: '#58a6ff',
+                        backgroundColor: paceGradient,
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: true,
+                        tension: 0.4,
+                        spanGaps: true
+                    }]
+                },
+                options: getCommonOptions('Pace (min/mi)', true) // reverse Y for pace
+            });
+
+            // Elevation Chart
+            const ctxElev = document.getElementById('elevationChart').getContext('2d');
+            const elevGradient = ctxElev.createLinearGradient(0, 0, 0, 400);
+            elevGradient.addColorStop(0, 'rgba(46, 160, 67, 0.5)'); // Greenish
+            elevGradient.addColorStop(1, 'rgba(46, 160, 67, 0.0)');
+
+            new Chart(ctxElev, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Elevation (ft)',
+                        data: elevData,
+                        borderColor: '#2ea043',
+                        backgroundColor: elevGradient,
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: getCommonOptions('Elevation (ft)', false)
+            });
+        }
+
+        function getCommonOptions(title, reverseY) {
+            return {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                plugins: {
+                    legend: { display: false },
+                    title: {
+                        display: true,
+                        text: title,
+                        color: '#f0f6fc',
+                        font: { size: 16, weight: '600' },
+                        align: 'start',
+                        padding: { bottom: 20 }
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(22, 27, 34, 0.9)',
+                        titleColor: '#8b949e',
+                        bodyColor: '#f0f6fc',
+                        borderColor: 'rgba(255, 255, 255, 0.1)',
+                        borderWidth: 1,
+                        padding: 12,
+                        displayColors: false,
+                        callbacks: {
+                            label: function (context) {
+                                let val = context.parsed.y;
+                                if (title.includes('Pace') && val) {
+                                    const m = Math.floor(val);
+                                    const s = Math.floor((val - m) * 60).toString().padStart(2, '0');
+                                    return `${m}:${s} /mi`;
+                                }
+                                return `${Math.round(val)}`;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                        ticks: { maxTicksLimit: 10 }
+                    },
+                    y: {
+                        reverse: reverseY,
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                        beginAtZero: false
+                    }
+                }
+            };
+        }
+
+        // Boot
+        init();
+    </script>
+</body>
+
+</html>
