@@ -46,3 +46,19 @@ All data is stored in `data/strava_warehouse.duckdb`. You can query it using Duc
 *   `analyze_effectiveness.py`: Calculates effectiveness metrics.
 *   `analyze_training_load.py`: Calculates TSB and recommends workouts.
 *   `ingest_workouts.py`: Scrapes Coros website for workout plans.
+
+## Running the Web API
+
+The project includes a FastAPI backend that serves the data. You can start the server locally or via Docker.
+
+**Start Locally using Uvicorn:**
+```bash
+python -m uvicorn src.api.main:app --reload
+```
+
+**Start using Docker Compose:**
+```bash
+docker-compose up --build
+```
+
+The API will be available at `http://127.0.0.1:8000`.
