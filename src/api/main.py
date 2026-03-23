@@ -12,6 +12,7 @@ import os
 import random
 import requests
 from dotenv import load_dotenv
+from typing import Optional
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -570,3 +571,223 @@ def get_vo2max(user_id: int):
     if not vo2max_data:
         raise HTTPException(status_code=404, detail="No stream data found to calculate VO2 Max for this user.")
     return vo2max_data
+
+def get_ai_training_plan(stats, race_date: str, race_type: str, goal_time: Optional[str] = None, pace_zones: Optional[dict] = None):
+    try:
+        current_date_str = stats.get('date', datetime.now().strftime('%Y-%m-%d'))
+        
+        prompt = (
+            f"The athlete is racing a {race_type} on {race_date}.\n"
+        )
+        if goal_time:
+            prompt += f"Their goal time is {goal_time}.\n"
+        else:
+            prompt += "They have not provided a goal time. Please recommend a challenging but realistic goal time based on their current fitness level (especially VO2 max and Threshold pace) and include it in your response.\n"
+            
+        prompt += (
+            f"Today's date is {current_date_str}.\n"
+            f"Please create a daily training plan from tomorrow until the race date.\n\n"
+            f"Current fitness stats to consider:\n"
+            f"- Fitness (CTL): {stats.get('fitness_ctl', 'N/A')}\n"
+            f"- Fatigue (ATL): {stats.get('fatigue_atl', 'N/A')}\n"
+            f"- Form (TSB): {stats.get('form_tsb', 'N/A')}\n"
+            f"- Estimated VO2 Max: {stats.get('latest_vo2_max', 'N/A')}\n"
+            f"- 7-Day Efficiency Factor: {stats.get('efficiency_factor_7d', 'N/A')}\n"
+            f"- 7-Day Aerobic Decoupling: {stats.get('aerobic_decoupling_7d', 'N/A')}%\n\n"
+            f"Based on these metrics, tailor the difficulty and volume of the plan. "
+            f"If fatigue is high, perhaps start with recovery. If fitness is high, challenge them appropriately.\n"
+        )
+        
+        if pace_zones and "pace_zones_min_per_mile" in pace_zones:
+            prompt += "\nUse the following exact pace zones based on their recent data when recommending how fast they should run:\n"
+            for z_name, z_range in pace_zones["pace_zones_min_per_mile"].items():
+                prompt += f"- {z_name}: {z_range}\n"
+            prompt += "\nMake sure to explicitly mention these paces in the workout 'description' so the user knows what speed to run at. Just use the mean of the pace zone range when providing the pace in the description.\n\n"
+        
+        llm_provider = os.getenv("LLM_PROVIDER", "local").lower()
+        
+        weight_str = f"weighs {stats.get('weight_lbs')}lbs" if stats.get('weight_lbs') else "weighs 220lbs"
+        sex_str = stats.get('sex', 'male')
+        if sex_str == 'M': sex_str = 'male'
+        elif sex_str == 'F': sex_str = 'female'
+        
+        system_prompt = (
+            f"You are an expert running coach. Your athlete is {sex_str} and {weight_str}. "
+            "You must respond STRICTLY with a valid JSON object. Do not include markdown formatting like ```json or any text outside the JSON framework. "
+            "The JSON object must have three keys:\n"
+            "1. 'blurb': a short introductory and motivating message about the plan.\n"
+            "2. 'recommended_goal_time': a string recommending a goal time based on their metrics. If they provided a goal time, just restate it.\n"
+            "3. 'plan': a dictionary where keys are the dates in 'YYYY-MM-DD' format, and values are objects with keys: "
+            "'type_of_workout' (e.g., Easy Run, Tempo, Long Run, Rest), 'training_focus' (the purpose of the workout), "
+            "'approximate_distance' (e.g., '5 miles'), and 'description' (detailed instructions)."
+        )
+
+        if llm_provider == "groq":
+            groq_api_key = os.getenv("GROQ_API_KEY")
+            if not groq_api_key:
+                return {"error": "Groq API key not set in environment (GROQ_API_KEY)."}
+                
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {"type": "json_object"}
+            }
+            headers = {
+                "Authorization": f"Bearer {groq_api_key}",
+                "Content-Type": "application/json"
+            }
+            try:
+                response = requests.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                if "choices" in data and len(data["choices"]) > 0:
+                    import json
+                    content = data["choices"][0]["message"]["content"]
+                    try:
+                        return json.loads(content)
+                    except json.JSONDecodeError:
+                        return {"error": "Failed to parse JSON response from LLM", "raw_content": content}
+                return {"error": "Invalid response format from Groq API."}
+            except requests.exceptions.HTTPError as e:
+                print(f"HTTPError on Groq API call: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f"Groq error response body: {e.response.text}")
+                return {"error": str(e)}
+        else:
+            return {"error": "This feature currently requires the LLM_PROVIDER to be set to groq in order to return properly formatted JSON."}
+
+    except Exception as e:
+        print(f"Error getting AI training plan: {e}")
+        return {"error": str(e)}
+
+@app.get("/schedule/{user_id}")
+def get_race_schedule(user_id: int, race_date: str, race_type: str, goal_time: Optional[str] = None):
+    # Validations
+    try:
+        datetime.strptime(race_date, '%Y-%m-%d')
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid race_date format. Must be YYYY-MM-DD.")
+        
+    valid_race_types = ["5k", "5 mile", "10k", "10 mile", "half marathon", "marathon"]
+    if race_type.lower() not in valid_race_types:
+        raise HTTPException(status_code=400, detail=f"Invalid race_type. Must be one of: {', '.join(valid_race_types)}")
+        
+    status = calculate_training_status_logic(user_id)
+    if not status:
+        # Fallback to an empty stats dict if they have no training history
+        status = {"user_id": user_id}
+        
+    pace_zones = calculate_pace_zones(user_id)
+        
+    plan = get_ai_training_plan(status, race_date, race_type, goal_time, pace_zones)
+    
+    if "error" in plan:
+        raise HTTPException(status_code=500, detail=plan["error"])
+        
+    return {
+        "user_id": user_id,
+        "race_date": race_date,
+        "race_type": race_type,
+        "goal_time": goal_time,
+        "pace_zones": pace_zones,
+        "schedule": plan
+    }
+
+def speed_to_pace_str(speed_ms):
+    if speed_ms <= 0 or pd.isna(speed_ms):
+        return "N/A"
+    mins = 26.8224 / speed_ms
+    m = int(mins)
+    s = int((mins - m) * 60)
+    return f"{m}:{s:02d} /mi"
+
+def calculate_pace_zones(user_id: int):
+    con = get_db_connection()
+    try:
+        max_hr_query = con.execute("SELECT MAX(max_heartrate) FROM dim_activity WHERE athlete_id=?", [user_id]).fetchone()
+        hr_max = max_hr_query[0] if max_hr_query and max_hr_query[0] and max_hr_query[0] > 100 else 190
+    except:
+        hr_max = 190
+
+    # Limit to recent activities for more accurate current zones (e.g. last 90 days)
+    try:
+        query = """
+        SELECT 
+            v.value as speed,
+            h.value as hr
+        FROM dim_activity a
+        JOIN stream_velocity v ON a.activity_id = v.activity_id
+        JOIN stream_heartrate h ON a.activity_id = h.activity_id AND v.time_offset = h.time_offset
+        WHERE a.athlete_id = ? AND a.type = 'Run'
+          AND v.value > 1.8 AND v.value < 8.0
+          AND h.value > 80 AND h.value <= ?
+          AND a.start_date_local >= current_date - interval '90 days'
+        """
+        df = con.execute(query, [user_id, hr_max + 10]).fetchdf()
+    except Exception as e:
+        print(f"Error querying streams for pace zones: {e}")
+        return None
+        
+    if df.empty:
+        return None
+
+    # Calculate Threshold Speed (T_speed)
+    # Target HR for threshold is typically 85%-92% of HR Max.
+    # To avoid hills throwing off the pace, we take the 80th percentile of speed in this HR range.
+    threshold_df = df[(df['hr'] >= hr_max * 0.85) & (df['hr'] <= hr_max * 0.92) & (df['speed'] > 2.0)]
+    
+    if len(threshold_df) >= 30:
+        t_speed = float(threshold_df['speed'].quantile(0.80))
+    else:
+        # Fallback to general high end speed if no threshold data
+        t_speed = float(df['speed'].quantile(0.90))
+
+    # Convert t_speed to pace in seconds per mile
+    t_pace_sec = 26.8224 / t_speed * 60  # convert m/s to seconds per mile (1609.34 / t_speed)
+    
+    # Coros Percentages of Threshold Pace:
+    # Recovery: > 140%
+    # Aerobic Endurance: 119% - 140%
+    # Aerobic Power: 106% - 119%
+    # Threshold: 94.5% - 106%
+    # Anaerobic Endurance: 85% - 94.5%
+    # Anaerobic Power: < 85%
+    
+    def format_pace(sec):
+        m = int(sec // 60)
+        s = int(sec % 60)
+        return f"{m}'{s:02d}\""
+
+    p140 = t_pace_sec * 1.40
+    p119 = t_pace_sec * 1.19
+    p106 = t_pace_sec * 1.06
+    p0945 = t_pace_sec * 0.945
+    p085 = t_pace_sec * 0.85
+    
+    # We subtract 1 second from the upper bound to prevent overlap, just like Coros
+    result = {
+        "Recovery": f">{format_pace(p140)}",
+        "Aerobic Endurance": f"{format_pace(p119)}-{format_pace(p140)}",
+        "Aerobic Power": f"{format_pace(p106)}-{format_pace(p119 - 1)}",
+        "Threshold": f"{format_pace(p0945)}-{format_pace(p106 - 1)}",
+        "Anaerobic Endurance": f"{format_pace(p085)}-{format_pace(p0945 - 1)}",
+        "Anaerobic Power": f"<{format_pace(p085)}"
+    }
+
+    return {
+        "user_id": user_id,
+        "hr_max_used": hr_max,
+        "pace_zones_min_per_mile": result
+    }
+
+@app.get("/pace_zones/{user_id}")
+def get_pace_zones(user_id: int):
+    zones = calculate_pace_zones(user_id)
+    if not zones:
+        raise HTTPException(status_code=404, detail="No stream data found to calculate Pace Zones for this user.")
+    return zones
+
